@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Broadcaster</title>
+  <link rel="icon" type="image/png" href="icons/icon32.png">
+  <link rel="stylesheet" href="workspace.css">
+</head>
+<body>
+  <main class="workspace">
+    <!-- Live AI panels (iframes) tiled side by side in ONE page -->
+    <section class="grid" id="grid" aria-label="AI panels"></section>
+
+    <!-- Floating fullscreen toggle, top-right corner -->
+    <button type="button" class="fs-btn" id="fsBtn" title="Toggle fullscreen" aria-label="Toggle fullscreen">⤢</button>
+
+    <!-- Bottom dock: panel count + composer -->
+    <footer class="dock">
+      <div class="count" id="panelCount" role="group" aria-label="Panel count">
+        <button type="button" data-count="2">02</button>
+        <button type="button" data-count="3">03</button>
+        <button type="button" data-count="4">04</button>
+        <button type="button" data-count="5">05</button>
+        <button type="button" data-count="6">06</button>
+      </div>
+
+      <form id="composer" class="composer">
+        <button type="button" class="icon-btn" id="attachBtn" title="Attach images" aria-label="Attach images">+</button>
+        <input id="imageInput" type="file" accept="image/*" multiple hidden>
+        <div class="image-strip" id="imageStrip"></div>
+        <textarea id="prompt" rows="1" placeholder="broadcast message…"
+          spellcheck="true" aria-label="Broadcast message"></textarea>
+        <button id="sendBtn" class="send-btn" type="submit" aria-label="Broadcast to all panels">SEND</button>
+      </form>
+    </footer>
+
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </main>
+
+  <script src="providers.js"></script>
+  <script src="workspace.js"></script>
+</body>
+</html>

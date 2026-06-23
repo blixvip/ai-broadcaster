@@ -1,0 +1,100 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "x-frame-options", "operation": "remove" },
+        { "header": "frame-options", "operation": "remove" },
+        { "header": "content-security-policy", "operation": "remove" },
+        { "header": "content-security-policy-report-only", "operation": "remove" },
+        { "header": "cross-origin-opener-policy", "operation": "remove" },
+        { "header": "cross-origin-embedder-policy", "operation": "remove" },
+        { "header": "cross-origin-resource-policy", "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "requestDomains": [
+        "gemini.google.com",
+        "copilot.microsoft.com",
+        "perplexity.ai",
+        "www.perplexity.ai",
+        "chat.deepseek.com",
+        "chat.qwen.ai",
+        "chat.qwenlm.ai",
+        "chat.mistral.ai",
+        "meta.ai",
+        "www.meta.ai",
+        "grok.com",
+        "kimi.com",
+        "www.kimi.com",
+        "kimi.ai",
+        "www.kimi.ai",
+        "kimi.moonshot.cn",
+        "huggingface.co",
+        "duck.ai",
+        "you.com",
+        "www.you.com",
+        "venice.ai",
+        "www.venice.ai",
+        "chat.venice.ai",
+        "poe.com",
+        "www.blackbox.ai",
+        "blackbox.ai",
+        "app.blackbox.ai",
+        "arena.ai",
+        "lmarena.ai",
+        "aistudio.google.com"
+      ],
+      "resourceTypes": ["sub_frame"]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Sec-Fetch-Dest", "operation": "remove" },
+        { "header": "Sec-Fetch-Mode", "operation": "remove" },
+        { "header": "Sec-Fetch-Site", "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "requestDomains": [
+        "gemini.google.com",
+        "copilot.microsoft.com",
+        "perplexity.ai",
+        "www.perplexity.ai",
+        "chat.deepseek.com",
+        "chat.qwen.ai",
+        "chat.qwenlm.ai",
+        "chat.mistral.ai",
+        "meta.ai",
+        "www.meta.ai",
+        "grok.com",
+        "kimi.com",
+        "www.kimi.com",
+        "kimi.ai",
+        "www.kimi.ai",
+        "kimi.moonshot.cn",
+        "huggingface.co",
+        "duck.ai",
+        "you.com",
+        "www.you.com",
+        "venice.ai",
+        "www.venice.ai",
+        "chat.venice.ai",
+        "poe.com",
+        "www.blackbox.ai",
+        "blackbox.ai",
+        "app.blackbox.ai",
+        "arena.ai",
+        "lmarena.ai",
+        "aistudio.google.com"
+      ],
+      "resourceTypes": ["sub_frame"]
+    }
+  }
+]

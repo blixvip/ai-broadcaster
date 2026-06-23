@@ -1,0 +1,289 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+  background: #050506;
+  font-family: 'Inter', system-ui, sans-serif;
+  color: #fff;
+}
+
+button, input, textarea, select {
+  font-family: inherit;
+  border: none;
+  outline: none;
+  color: inherit;
+}
+
+/* ── Layout shell: grid fills the page, dock floats over the bottom ── */
+.workspace {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Panel grid (the three-panels-in-one-page) ─────────────────── */
+.grid {
+  flex: 1;
+  display: grid;
+  gap: 1px;
+  min-height: 0;
+  background: #050506;
+  padding-bottom: 84px;          /* clearance for the floating dock */
+}
+
+.panel {
+  position: relative;          /* positioning context for the loading veil */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: #0c0d11;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.panel:last-child { border-right: none; }
+
+/* Per-panel header: provider select + URL bar + go + reload */
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 42px;
+  flex-shrink: 0;
+  padding: 0 8px;
+  background: linear-gradient(180deg, #16171c 0%, #0d0e12 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.panel-select {
+  height: 28px;
+  padding: 0 6px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+  max-width: 140px;
+}
+.panel-select option { background: #14151a; color: #fff; }
+
+.panel-url {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+}
+.panel-url:focus { border-color: rgba(102, 252, 241, 0.5); }
+
+.panel-btn {
+  width: 28px; height: 28px; flex-shrink: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
+.panel-btn:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+.panel-btn.active {
+  background: rgba(102, 252, 241, 0.18);
+  border-color: rgba(102, 252, 241, 0.55);
+  color: #9af7f0;
+}
+
+.panel iframe {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #e7e7ea;
+  min-height: 0;
+}
+
+/* ── Popped-out-to-window placeholder ──────────────────────────── */
+.panel-windowed {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px;
+  text-align: center;
+  background:
+    radial-gradient(circle at 50% 30%, rgba(102, 252, 241, 0.08), transparent 60%),
+    #0c0d11;
+}
+.panel-windowed .pw-icon { font-size: 34px; color: #66fcf1; line-height: 1; }
+.panel-windowed .pw-title { font-size: 16px; font-weight: 700; color: #fff; }
+.panel-windowed .pw-sub {
+  font-size: 12px; line-height: 1.5;
+  color: rgba(255, 255, 255, 0.55);
+}
+.panel-windowed .pw-btn {
+  margin-top: 4px;
+  min-width: 168px;
+  height: 34px; padding: 0 16px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #66fcf1, #45a29e);
+  border: none;
+  color: #04181a;
+  font-size: 13px; font-weight: 700;
+  cursor: pointer;
+}
+.panel-windowed .pw-btn.ghost {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.82);
+  font-weight: 600;
+}
+.panel-windowed .pw-btn:hover { filter: brightness(1.08); }
+
+/* ── Loading veil (covers the frame until it confirms it embedded) ── */
+.panel-loading {
+  position: absolute;
+  left: 0; right: 0; top: 42px; bottom: 0;   /* below the 42px panel head */
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: #0c0d11;
+}
+.panel-loading .pl-spin {
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.14);
+  border-top-color: #66fcf1;
+  animation: aibSpin 0.8s linear infinite;
+}
+.panel-loading .pl-text {
+  font-size: 13px; font-weight: 600;
+  color: rgba(255, 255, 255, 0.6);
+}
+@keyframes aibSpin { to { transform: rotate(360deg); } }
+
+/* ── Floating fullscreen toggle ────────────────────────────────── */
+.fs-btn {
+  position: fixed;
+  top: 7px; right: 9px;
+  z-index: 30;
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: rgba(10, 11, 15, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 16px; line-height: 1; cursor: pointer;
+}
+.fs-btn:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+
+/* ── Bottom dock ───────────────────────────────────────────────── */
+.dock {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background:
+    radial-gradient(circle at 12% 130%, rgba(130, 210, 255, 0.16), transparent 45%),
+    radial-gradient(circle at 88% 130%, rgba(214, 179, 255, 0.18), transparent 45%),
+    linear-gradient(180deg, transparent 0%, rgba(5, 5, 6, 0.82) 38%, #050506 100%);
+}
+
+.count { display: flex; gap: 6px; flex-shrink: 0; }
+.count button {
+  width: 46px; height: 46px;
+  border-radius: 12px;
+  background: rgba(8, 9, 12, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 14px; font-weight: 700;
+  cursor: pointer;
+}
+.count button.active {
+  border-color: rgba(102, 252, 241, 0.6);
+  background: rgba(102, 252, 241, 0.14);
+  color: #fff;
+}
+
+.composer {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  background: rgba(2, 2, 3, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  padding: 7px 7px 7px 12px;
+}
+.icon-btn {
+  width: 38px; height: 38px; flex-shrink: 0;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 22px; line-height: 1; cursor: pointer;
+}
+.icon-btn:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+
+.image-strip { display: flex; gap: 5px; flex-shrink: 0; }
+.image-strip:empty { display: none; }
+.image-tile {
+  position: relative; width: 38px; height: 38px;
+  border-radius: 8px; overflow: hidden; background: #333; flex-shrink: 0;
+}
+.image-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.image-tile .remove-btn {
+  position: absolute; top: 1px; right: 1px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: rgba(0, 0, 0, 0.65); color: #fff;
+  font-size: 10px; line-height: 15px; text-align: center; cursor: pointer;
+}
+
+#prompt {
+  flex: 1; min-width: 0;
+  height: 38px; max-height: 120px;
+  padding: 9px 10px;
+  background: transparent;
+  color: #fff;
+  font-size: 15px; resize: none;
+  line-height: 1.35;
+}
+#prompt::placeholder { color: rgba(255, 255, 255, 0.34); }
+
+.send-btn {
+  flex-shrink: 0;
+  height: 44px; padding: 0 30px;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #66fcf1, #45a29e);
+  color: #04181a;
+  font-size: 15px; font-weight: 800; letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Status ────────────────────────────────────────────────────── */
+.status {
+  position: fixed;
+  left: 16px; bottom: 66px;
+  z-index: 25;
+  font-size: 12px; font-weight: 500;
+  color: rgba(255, 255, 255, 0.72);
+  pointer-events: none;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+.status.success { color: #5ef0c0; }
+.status.error { color: #f87171; }

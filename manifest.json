@@ -1,0 +1,153 @@
+{
+  "manifest_version": 3,
+  "name": "AI Broadcaster",
+  "version": "1.3.1",
+  "description": "Broadcast prompts and images to free-tier AI chats from one workspace.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "declarativeNetRequest",
+    "browsingData",
+    "tabs",
+    "webNavigation",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*",
+    "https://perplexity.ai/*",
+    "https://www.perplexity.ai/*",
+    "https://chat.deepseek.com/*",
+    "https://chat.qwen.ai/*",
+    "https://chat.qwenlm.ai/*",
+    "https://chat.mistral.ai/*",
+    "https://meta.ai/*",
+    "https://www.meta.ai/*",
+    "https://grok.com/*",
+    "https://kimi.com/*",
+    "https://www.kimi.com/*",
+    "https://kimi.ai/*",
+    "https://www.kimi.ai/*",
+    "https://kimi.moonshot.cn/*",
+    "https://huggingface.co/*",
+    "https://duck.ai/*",
+    "https://you.com/*",
+    "https://www.you.com/*",
+    "https://venice.ai/*",
+    "https://www.venice.ai/*",
+    "https://chat.venice.ai/*",
+    "https://poe.com/*",
+    "https://www.blackbox.ai/*",
+    "https://blackbox.ai/*",
+    "https://app.blackbox.ai/*",
+    "https://arena.ai/*",
+    "https://lmarena.ai/*",
+    "https://aistudio.google.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Broadcaster",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ai_frame_rules",
+        "enabled": true,
+        "path": "rules/ai_frame_rules.json"
+      }
+    ]
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' https: data:; frame-src https:;"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://perplexity.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://chat.qwenlm.ai/*",
+        "https://chat.mistral.ai/*",
+        "https://meta.ai/*",
+        "https://www.meta.ai/*",
+        "https://grok.com/*",
+        "https://kimi.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.ai/*",
+        "https://www.kimi.ai/*",
+        "https://kimi.moonshot.cn/*",
+        "https://huggingface.co/*",
+        "https://duck.ai/*",
+        "https://you.com/*",
+        "https://www.you.com/*",
+        "https://venice.ai/*",
+        "https://www.venice.ai/*",
+        "https://chat.venice.ai/*",
+        "https://poe.com/*",
+        "https://www.blackbox.ai/*",
+        "https://blackbox.ai/*",
+        "https://app.blackbox.ai/*",
+        "https://arena.ai/*",
+        "https://lmarena.ai/*",
+        "https://aistudio.google.com/*"
+      ],
+      "js": ["frame-bypass.js"],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://perplexity.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://chat.qwenlm.ai/*",
+        "https://chat.mistral.ai/*",
+        "https://meta.ai/*",
+        "https://www.meta.ai/*",
+        "https://grok.com/*",
+        "https://kimi.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.ai/*",
+        "https://www.kimi.ai/*",
+        "https://kimi.moonshot.cn/*",
+        "https://huggingface.co/*",
+        "https://duck.ai/*",
+        "https://you.com/*",
+        "https://www.you.com/*",
+        "https://venice.ai/*",
+        "https://www.venice.ai/*",
+        "https://chat.venice.ai/*",
+        "https://poe.com/*",
+        "https://www.blackbox.ai/*",
+        "https://blackbox.ai/*",
+        "https://app.blackbox.ai/*",
+        "https://arena.ai/*",
+        "https://lmarena.ai/*",
+        "https://aistudio.google.com/*"
+      ],
+      "js": ["providers.js", "content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}
