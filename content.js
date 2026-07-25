@@ -1,8 +1,24 @@
 'use strict';
 
-// Timestamp guard prevents double-injection when both paths fire
-if (!window._aibTs) window._aibTs = 0;
+const DELIVERY = globalThis.AIBDeliveryProtocol;
 const AIB_HOSTS = new Set(globalThis.AIB_AI_HOSTS || []);
+const ATTEMPT_CACHE_LIMIT = 64;
+const ATTEMPT_CACHE_TTL_MS = 5 * 60 * 1000;
+const attemptCache = new Map();
+let activeAttemptId = null;
+let panelBinding = { panelId: null, panelEpoch: null, providerKey: null };
+let lastInputDiagnostic = null;
+let lastSubmitDiagnostic = null;
+let responseTrackerToken = 0;
+let debugOverlaysEnabled = false;
+chrome.storage.local.get('aib_debug_overlays')
+  .then(value => { debugOverlaysEnabled = value.aib_debug_overlays === true; })
+  .catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.aib_debug_overlays) {
+    debugOverlaysEnabled = changes.aib_debug_overlays.newValue === true;
+  }
+});
 
 function isWorkspacePanelFrame() {
   try {
@@ -14,23 +30,12 @@ function isWorkspacePanelFrame() {
   }
 }
 
-function cleanupLegacyWorkspaceMutation() {
-  document.getElementById('aib-hide-input-style')?.remove();
-  for (const el of document.querySelectorAll('[data-aib-hide]')) {
-    delete el.dataset.aibHide;
-  }
-  delete document.documentElement.dataset.aibInjecting;
-}
-
-cleanupLegacyWorkspaceMutation();
-document.addEventListener('DOMContentLoaded', cleanupLegacyWorkspaceMutation, { once: true });
-
 // Group-based timeouts (ms) — background tags each payload with its group.
 // Group A = fast/reliable, B = search/specialist, C = complex/shadow-DOM.
 const GROUP_TIMEOUTS = {
-  A: { input: 4000,  submit: 3000  },
-  B: { input: 7000,  submit: 5000  },
-  C: { input: 10000, submit: 7000  }
+  A: { input: 4000,  submit: 3000, evidence: 12000 },
+  B: { input: 7000,  submit: 5000, evidence: 20000 },
+  C: { input: 10000, submit: 7000, evidence: 30000 }
 };
 
 // Platform configs — precise selectors per hostname.
@@ -41,6 +46,12 @@ const GROUP_TIMEOUTS = {
 const PLATFORMS = {
   // ── Group A ──────────────────────────────────────────────────────────────
   'gemini.google.com': {
+    responseSels: [
+      'model-response message-content',
+      'model-response .model-response-text',
+      '.model-response-text',
+      'message-content'
+    ],
     inputSels: [
       '.ql-editor[contenteditable="true"]',
       'rich-textarea div[contenteditable="true"]',
@@ -57,6 +68,11 @@ const PLATFORMS = {
     group: 'A'
   },
   'chat.deepseek.com': {
+    responseSels: [
+      '.ds-markdown--block',
+      '.ds-markdown',
+      '[class*="assistant" i] [class*="markdown" i]'
+    ],
     inputSels: [
       'textarea#chat-input',
       'textarea[placeholder]',
@@ -72,6 +88,10 @@ const PLATFORMS = {
     group: 'A'
   },
   'chat.mistral.ai': {
+    responseSels: [
+      '[data-message-author-role="assistant"]',
+      '[data-testid="text-message-part"]'
+    ],
     inputSels: [
       // Le Chat uses ProseMirror (contenteditable div) on homepage and in chat
       '.ProseMirror[contenteditable="true"]',
@@ -94,11 +114,27 @@ const PLATFORMS = {
     ],
     type: 'auto',
     group: 'B',
+    submitEvidenceTimeoutMs: 30000,
+    attachmentsRequireLogin: true,
     preClick: true
   },
   'grok.com': {
+    responseSels: [
+      '[data-message-author-role="assistant"]',
+      '[data-testid*="grok-response" i]',
+      '[data-testid*="assistant" i]',
+      '[data-testid*="markdown" i]',
+      '.response-content-markdown'
+    ],
+    userSels: [
+      '[data-message-author-role="user"]',
+      '[data-testid*="user-message" i]',
+      '[data-testid*="grok-query" i]'
+    ],
     inputSels: [
       'textarea[data-testid="userInput"]',
+      'textarea[data-testid*="grok" i]',
+      'div[contenteditable="true"][data-testid*="grok" i]',
       'textarea[placeholder*="know" i]',
       'textarea[placeholder*="Ask" i]',
       'textarea[placeholder*="Grok" i]',
@@ -108,13 +144,13 @@ const PLATFORMS = {
     submitSels: [
       'button[data-testid="chat-submit"]',
       'button[data-testid="send-button"]',
+      'button[data-testid*="grok" i][data-testid*="send" i]',
       'button[aria-label*="Submit" i]',
       'button[aria-label*="Send" i]',
       'button[type="submit"]'
     ],
     type: 'auto',
-    // grok.com is fast once up but slow to FIRST paint inside a fresh iframe;
-    // group B's longer input timeout avoids "no input box" on cold load.
+    // Both grok.com and X's /i/grok surface can be slow to first paint.
     group: 'B'
   },
 
@@ -254,6 +290,12 @@ const PLATFORMS = {
     group: 'B'
   },
   'venice.ai': {
+    responseSels: [
+      '[data-message-author-role="assistant"]',
+      '[data-testid*="assistant" i]',
+      '[class*="assistant" i] .prose',
+      '.prose'
+    ],
     inputSels: [
       'textarea[aria-label*="Chat message" i]',
       'textarea[name="prompt-textarea"]',
@@ -271,7 +313,8 @@ const PLATFORMS = {
       'button[type="submit"]'
     ],
     type: 'auto',
-    group: 'B'
+    group: 'B',
+    imageFileSels: ['input[data-testid="minds-chat-file-input"][type="file"]']
   },
   'lmarena.ai': {
     inputSels: [
@@ -605,6 +648,15 @@ const PLATFORMS = {
   }
 };
 
+// X Premium/Premium+ accounts access Grok through X's authenticated surface.
+// Twitter hostnames are retained because older links may redirect through them.
+for (const host of ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com']) {
+  PLATFORMS[host] = PLATFORMS['grok.com'];
+}
+for (const host of ['www.venice.ai', 'chat.venice.ai']) {
+  PLATFORMS[host] = PLATFORMS['venice.ai'];
+}
+
 const COMMON_INPUT_SELS = [
   // Rich-text editors (ProseMirror, Lexical, Quill) — checked first
   '.ProseMirror[contenteditable="true"]',
@@ -651,6 +703,63 @@ const COMMON_SUBMIT_SELS = [
   'button[type="submit"]'
 ];
 
+// During generation most providers replace Send with a Stop control. Detecting
+// that control is the safest cross-provider signal that an answer is active.
+const COMMON_STOP_SELS = [
+  'button[data-testid="stop-button"]',
+  'button[data-testid*="stop" i]',
+  'button[data-testid*="pause" i]',
+  'button[aria-label*="stop generating" i]',
+  'button[aria-label*="stop response" i]',
+  'button[aria-label*="stop answer" i]',
+  'button[aria-label*="pause generat" i]',
+  'button[aria-label*="pause response" i]',
+  'button[aria-label="Stop"]',
+  'button[title*="stop generating" i]',
+  'button[title*="stop response" i]',
+  'button[title*="pause generat" i]',
+  'button[title*="pause response" i]',
+  '[role="button"][aria-label*="stop generating" i]',
+  '[role="button"][aria-label*="stop response" i]',
+  '[role="button"][aria-label*="pause generat" i]',
+  '[role="button"][aria-label*="pause response" i]',
+  '[role="button"][data-testid*="stop" i]'
+];
+
+// Selectors for the AI's *response* container, ordered specific → generic. Used
+// by getResponseText() to grab the latest reply so it can be shipped to Warp.
+// Per-site `responseSels` (in PLATFORMS) are tried first, then these fall backs.
+// The reader tries each selector in order and, for the first that matches any
+// visible element, returns the LAST match (= newest message in document order).
+const COMMON_RESPONSE_SELS = [
+  '[data-testid="assistant-message"]',
+  '.model-response-text',                      // Gemini
+  'message-content',                           // Gemini custom element
+  '.markdown-main-panel',                      // Gemini
+  '.response-content-markdown',                // Grok
+  '.prose-response, .message-bubble--assistant',
+  '[class*="assistant" i] [class*="markdown" i]',
+  '[class*="message" i][class*="assistant" i]',
+  '[class*="response" i][class*="content" i]',
+  '.markdown',                                 // many Tailwind chat UIs
+  '.prose',
+  '[class*="markdown" i]'
+];
+
+// Strict user-message containers. These intentionally avoid broad selectors
+// such as `.message` so capture never mistakes the entire conversation for the
+// newest prompt.
+const COMMON_USER_MESSAGE_SELS = [
+  '[data-message-author-role="user"]',
+  '[data-testid="user-message"]',
+  '[data-author="user"]',
+  '[data-role="user"]',
+  'user-query .query-text',                     // Gemini
+  'user-query',
+  '[class*="user-message" i]',
+  '[class*="message" i][class*="user" i]'
+];
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -669,7 +778,8 @@ function getConfig() {
     directInputSels: config.inputSels,
     directSubmitSels: config.submitSels,
     inputSels: uniqueList([...config.inputSels, ...COMMON_INPUT_SELS]),
-    submitSels: uniqueList([...config.submitSels, ...COMMON_SUBMIT_SELS])
+    submitSels: uniqueList([...config.submitSels, ...COMMON_SUBMIT_SELS]),
+    stopSels: uniqueList([...(config.stopSels || []), ...COMMON_STOP_SELS])
   };
 }
 
@@ -705,11 +815,7 @@ function sleep(ms) {
 }
 
 function shouldAvoidAutomationScroll() {
-  try {
-    return window.self !== window.top || document.documentElement.dataset.aibInjecting === '1';
-  } catch {
-    return true;
-  }
+  return isWorkspacePanelFrame();
 }
 
 function focusElement(el) {
@@ -873,19 +979,119 @@ function findBestInput(selectors) {
         const input = normalizeInputCandidate(el);
         if (!input || candidates.some(candidate => candidate.el === input)) continue;
         const score = scoreInputCandidate(input, selectorIndex);
-        if (score >= 0) candidates.push({ el: input, score });
+        if (score >= 0) candidates.push({ el: input, score, selector, selectorIndex });
       }
     } catch {}
   });
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0]?.el || null;
+  const best = candidates[0] || null;
+  lastInputDiagnostic = best ? {
+    selector: best.selector,
+    selectorIndex: best.selectorIndex,
+    score: Math.round(best.score),
+    candidateCount: candidates.length
+  } : {
+    selector: null,
+    selectorIndex: null,
+    score: null,
+    candidateCount: 0
+  };
+  return best?.el || null;
 }
 
 function getInputText(el) {
   if (!el) return '';
   if ('value' in el) return el.value || '';
   return el.innerText || el.textContent || '';
+}
+
+// ── Response capture (for "→ Warp") ────────────────────────────────────────
+// Read the AI's latest reply as plain text. Deliberately dumb: the user clicks
+// the button once the answer is done, so no stream-completion detection.
+function isVisibleWithText(el) {
+  if (!el) return false;
+  try {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+  } catch { return false; }
+  return (el.innerText || el.textContent || '').trim().length > 0;
+}
+
+function elPlainText(el) {
+  return (el?.innerText || el?.textContent || '').trim();
+}
+
+// Does this element contain a distinct user-message turn? If so it's a
+// conversation wrapper (spans the whole chat), not a single assistant reply.
+function containsUserMessage(el) {
+  return COMMON_USER_MESSAGE_SELS.some(sel => {
+    try { return queryAllDeep(sel, el).some(isVisibleWithText); } catch { return false; }
+  });
+}
+
+// Given a wrapper that holds the whole conversation, keep ONLY the final
+// assistant turn: the visible text that comes after the last user message.
+function textAfterLastUser(wrapper) {
+  const users = COMMON_USER_MESSAGE_SELS.flatMap(sel => {
+    try { return queryAllDeep(sel, wrapper).filter(isVisibleWithText); } catch { return []; }
+  });
+  if (!users.length) return elPlainText(wrapper);
+  const lastUser = users[users.length - 1];
+
+  const walker = document.createTreeWalker(wrapper, NodeFilter.SHOW_TEXT, {
+    acceptNode: n => (n.nodeValue && n.nodeValue.trim()) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+  });
+  const parts = [];
+  let passedLastUser = false;
+  while (walker.nextNode()) {
+    const n = walker.currentNode;
+    if (!passedLastUser) {
+      const pos = lastUser.compareDocumentPosition(n);
+      const following = pos & Node.DOCUMENT_POSITION_FOLLOWING;
+      const contained = pos & Node.DOCUMENT_POSITION_CONTAINED_BY;
+      if (following && !contained) passedLastUser = true;   // strictly after the user's subtree
+      else continue;
+    }
+    parts.push(n.nodeValue.replace(/[ \t]+/g, ' ').trim());
+  }
+  return parts.filter(Boolean).join('\n').trim() || elPlainText(wrapper);
+}
+
+// Pick the newest single assistant reply. For the first selector that matches,
+// drop elements that wrap OTHER matches (ancestors) and elements that contain a
+// user turn (whole-chat wrappers), then take the last one left.
+function pickLatestAssistant(selectors) {
+  for (const sel of selectors) {
+    let matches;
+    try { matches = queryAllDeep(sel).filter(isVisibleWithText); } catch { continue; }
+    if (!matches.length) continue;
+    const leaves = matches.filter(el => !matches.some(o => o !== el && el.contains(o)));
+    const pool = leaves.length ? leaves : matches;
+    const singles = pool.filter(el => !containsUserMessage(el));
+    const chosen = singles.length ? singles : pool;
+    const el = chosen[chosen.length - 1];
+    if (el && elPlainText(el)) return el;
+  }
+  return null;
+}
+
+function getResponseText() {
+  const cfg = getConfig();
+  const sels = uniqueList([...(cfg?.responseSels || []), ...COMMON_RESPONSE_SELS]);
+  const el = pickLatestAssistant(sels);
+  if (!el) return '';
+  // Even the chosen element can be a whole-conversation container on some sites
+  // (e.g. one big `.markdown`); narrow it to just the final turn.
+  return containsUserMessage(el) ? textAfterLastUser(el) : elPlainText(el);
+}
+
+function getLatestAssistantResponse() {
+  return {
+    text: getResponseText()
+  };
 }
 
 function normalizeComparableText(value) {
@@ -1047,36 +1253,39 @@ async function waitForInput(config, timeoutMs) {
   return findBestInput(config.inputSels);
 }
 
-async function injectTextViaClipboardEvent(el, text) {
-  focusElement(el);
-  if ('value' in el) {
-    const proto = Object.getPrototypeOf(el);
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
-      || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-    if (setter) setter.call(el, ''); else el.value = '';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+async function injectTextViaPaste(input, text) {
+  focusElement(input);
+  if ('value' in input) {
+    setNativeValue(input, '');
+    dispatchInput(input, '', 'deleteContentBackward');
   } else {
-    document.execCommand('selectAll', false, null);
-    document.execCommand('delete', false, null);
+    selectAllInEditable(input);
+    try { document.execCommand('delete', false, null); } catch {}
   }
-  const dt = new DataTransfer();
-  dt.setData('text/plain', text);
-  dt.setData('text/html', text);
-  el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true, composed: true }));
-  await sleep(60);
+
+  try {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', text);
+    clipboardData.setData('text/html', text.replace(/&/g, '&amp;').replace(/</g, '&lt;'));
+    input.dispatchEvent(new ClipboardEvent('paste', {
+      clipboardData,
+      bubbles: true,
+      cancelable: true,
+      composed: true
+    }));
+  } catch {}
+  await sleep(180);
+  return textWasFullyInserted(input, text);
 }
 
 async function injectTextReliably(input, text, type) {
   for (let attempt = 0; attempt < 3; attempt++) {
     injectText(input, text, type);
-    await sleep(140);
+    await sleep(180);
     if (textWasFullyInserted(input, text)) return true;
   }
 
-  // Last resort: the clear-then-paste path.
-  await injectTextViaClipboardEvent(input, text);
-  await sleep(120);
-  return textWasFullyInserted(input, text);
+  return injectTextViaPaste(input, text);
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,18 +1293,25 @@ async function injectTextReliably(input, text, type) {
 // ---------------------------------------------------------------------------
 
 function imagePayloadsFromData(data) {
-  if (Array.isArray(data.images)) {
-    return data.images
-      .filter(image => image?.base64)
-      .map(image => ({
-        base64: image.base64,
-        name: image.name || 'image.png',
-        type: image.type || 'image/png'
+  const source = Array.isArray(data.attachments) ? data.attachments : data.images;
+  if (Array.isArray(source)) {
+    return source
+      .filter(attachment => attachment?.base64)
+      .map(attachment => ({
+        base64: attachment.base64,
+        name: attachment.name || (attachment.type === 'application/pdf' ? 'document.pdf' : 'image.png'),
+        type: attachment.type || 'image/png',
+        size: Number(attachment.size) || DELIVERY.estimatedDataUrlBytes(attachment.base64)
       }));
   }
 
   return data.imageBase64
-    ? [{ base64: data.imageBase64, name: data.imageName || 'image.png', type: data.imageType || 'image/png' }]
+    ? [{
+      base64: data.imageBase64,
+      name: data.imageName || (data.imageType === 'application/pdf' ? 'document.pdf' : 'image.png'),
+      type: data.imageType || 'image/png',
+      size: DELIVERY.estimatedDataUrlBytes(data.imageBase64)
+    }]
     : [];
 }
 
@@ -1124,7 +1340,18 @@ function findImageFileInput(config, inputEl) {
   return null;
 }
 
+function fileInputAcceptsFiles(fileInput, files) {
+  if (!fileInput.multiple && files.length > 1) return false;
+  const accept = String(fileInput.accept || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+  if (!accept.length) return true;
+  return files.every(file => accept.some(rule =>
+    rule === file.type.toLowerCase()
+      || (rule.endsWith('/*') && file.type.toLowerCase().startsWith(rule.slice(0, -1)))
+      || (rule.startsWith('.') && file.name.toLowerCase().endsWith(rule))));
+}
+
 function injectImagesIntoFileInput(fileInput, files) {
+  if (!fileInputAcceptsFiles(fileInput, files)) return false;
   try {
     const dt = dataTransferWithFiles(files);
     fileInput.files = dt.files;
@@ -1136,15 +1363,11 @@ function injectImagesIntoFileInput(fileInput, files) {
   }
 }
 
-async function injectImages(inputEl, images, config) {
-  if (!images.length) return;
-
-  const files = filesFromImages(images);
-  const fileInput = findImageFileInput(config, inputEl);
-  if (fileInput && injectImagesIntoFileInput(fileInput, files)) return;
-
+// Synthetic paste of image files (APPENDS to whatever is already attached).
+function pasteImages(inputEl, images) {
+  if (!images.length) return false;
   try {
-    const dt = dataTransferWithFiles(files);
+    const dt = dataTransferWithFiles(filesFromImages(images));
     focusElement(inputEl);
     inputEl.dispatchEvent(new ClipboardEvent('paste', {
       clipboardData: dt,
@@ -1152,12 +1375,94 @@ async function injectImages(inputEl, images, config) {
       cancelable: true,
       composed: true
     }));
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One-shot best-effort attach of ALL images (file-input path first, else paste).
+async function injectImages(inputEl, images, config) {
+  if (!images.length) return true;
+  const files = filesFromImages(images);
+  const fileInput = findImageFileInput(config, inputEl);
+  if (fileInput && injectImagesIntoFileInput(fileInput, files)) return true;
+  return pasteImages(inputEl, images);
 }
 
 // ---------------------------------------------------------------------------
 // Submit
 // ---------------------------------------------------------------------------
+
+function isStopCandidate(el) {
+  if (!isUsable(el)) return false;
+  const label = labelFor(el);
+  if (/\b(upload|attachment|file|image|photo|audio|voice|recording|sharing)\b/.test(label)) return false;
+  const hasStop = /\bstop\b/.test(label);
+  const hasPause = /\bpause\b/.test(label);
+  const describesGeneration = /\b(generat|response|answer|message|run)\b/.test(label);
+  return (hasStop || hasPause)
+    && (describesGeneration || (hasStop && /(^|\s)stop($|\s)/.test(label)) || /stop-button/.test(label));
+}
+
+function scoreStopCandidate(el, inputEl) {
+  if (!isStopCandidate(el)) return -1;
+  const label = labelFor(el);
+  let score = 50;
+  if (/\b(generat|response|answer)\b/.test(label)) score += 80;
+  if (/stop-button/.test(label)) score += 70;
+
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 72 && rect.height <= 72) score += 12;
+  if (inputEl) {
+    const inputRect = inputEl.getBoundingClientRect();
+    const distance = Math.hypot(
+      (rect.left + rect.right - inputRect.left - inputRect.right) / 2,
+      (rect.top + rect.bottom - inputRect.top - inputRect.bottom) / 2
+    );
+    score += Math.max(0, 80 - distance / 8);
+  } else {
+    score += Math.max(0, 30 - bottomCenterDistance(rect) / 20);
+  }
+  return score;
+}
+
+function findStopButton(config, inputEl) {
+  const candidates = [];
+  for (const sel of config.stopSels || COMMON_STOP_SELS) {
+    try { candidates.push(...queryAllDeep(sel)); } catch {}
+  }
+  // Some providers expose only visible button text, with no useful attributes.
+  try { candidates.push(...queryAllDeep('button,[role="button"]')); } catch {}
+  return uniqueElements(candidates)
+    .filter(el => scoreStopCandidate(el, inputEl) >= 0)
+    .sort((a, b) => scoreStopCandidate(b, inputEl) - scoreStopCandidate(a, inputEl))[0] || null;
+}
+
+// Stop at most once, then wait for the provider to return to an idle composer.
+// If it never settles, abort this broadcast instead of pasting into a busy chat.
+async function stopActiveGeneration(config, inputEl) {
+  const stop = findStopButton(config, inputEl);
+  if (!stop) return true;
+
+  flashHighlight(stop);
+  clickElement(stop);
+
+  const timeoutMs = config.stopTimeoutMs || 10000;
+  const started = Date.now();
+  let idleSince = 0;
+  while (Date.now() - started < timeoutMs) {
+    if (findStopButton(config, inputEl)) {
+      idleSince = 0;
+    } else if (!idleSince) {
+      idleSince = Date.now();
+    } else if (Date.now() - idleSince >= 300) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
 
 function isBadSubmitCandidate(el) {
   const label = labelFor(el);
@@ -1217,7 +1522,14 @@ function findSubmitButton(config, inputEl) {
       const usable = buttons
         .filter(el => scoreSubmitCandidate(el, inputEl) >= 0)
         .sort((a, b) => scoreSubmitCandidate(b, inputEl) - scoreSubmitCandidate(a, inputEl))[0];
-      if (usable) return usable;
+      if (usable) {
+        lastSubmitDiagnostic = {
+          selector: sel,
+          score: Math.round(scoreSubmitCandidate(usable, inputEl)),
+          fallback: false
+        };
+        return usable;
+      }
     } catch {}
   }
 
@@ -1226,44 +1538,223 @@ function findSubmitButton(config, inputEl) {
     .filter(el => scoreSubmitCandidate(el, inputEl) >= 18)
     .sort((a, b) => scoreSubmitCandidate(b, inputEl) - scoreSubmitCandidate(a, inputEl));
 
-  return candidates[0] || null;
+  const best = candidates[0] || null;
+  lastSubmitDiagnostic = best ? {
+    selector: 'button,[role="button"]',
+    score: Math.round(scoreSubmitCandidate(best, inputEl)),
+    fallback: true
+  } : {
+    selector: null,
+    score: null,
+    fallback: true
+  };
+  return best;
 }
 
-function uploadStillBusy() {
+function uploadStillBusy(inputEl) {
   const busySelectors = [
     '[aria-label*="uploading" i]',
     '[aria-label*="upload" i][aria-busy="true"]',
     '[data-testid*="upload" i][aria-busy="true"]',
+    '[data-testid*="attachment" i][aria-busy="true"]',
+    '[class*="upload" i][aria-busy="true"]',
     '[role="progressbar"]',
     'progress'
   ];
+  const roots = inputEl ? composerRoots(inputEl) : [document];
 
   return busySelectors.some(sel => {
     try {
-      return queryAllDeep(sel).some(isUsable);
+      return queryAllDeepFromRoots(sel, roots).some(isUsable);
     } catch {
       return false;
     }
   });
 }
 
-async function waitForImagesReady(config, imageCount) {
-  const settleMs = config.imageSettleMs || Math.min(1800, 650 + imageCount * 220);
-  const timeoutMs = config.imageReadyTimeoutMs || Math.min(7000, 2600 + imageCount * 850);
+async function waitForComposerUploadIdle(inputEl, timeoutMs) {
   const started = Date.now();
   let idleSince = 0;
-
-  await sleep(settleMs);
   while (Date.now() - started < timeoutMs) {
-    if (uploadStillBusy()) {
+    if (uploadStillBusy(inputEl)) {
       idleSince = 0;
     } else if (!idleSince) {
       idleSince = Date.now();
-    } else if (Date.now() - idleSince >= 240) {
-      return;
+    } else if (Date.now() - idleSince >= 300) {
+      return true;
     }
     await sleep(120);
   }
+  return false;
+}
+
+// Tight composer-only roots (NOT document.body) so we count only the attachment
+// thumbnail of the message being composed — never images from the chat history.
+function composerRoots(inputEl) {
+  return uniqueElements([
+    inputEl?.closest?.('form'),
+    inputEl?.closest?.('[role="form"]'),
+    inputEl?.closest?.('[data-testid*="composer" i]'),
+    inputEl?.closest?.('[class*="composer" i]'),
+    inputEl?.closest?.('[class*="input" i]'),
+    inputEl?.closest?.('.input-area'),
+    inputEl?.closest?.('[class*="chat-input-card" i]'),
+    inputEl?.closest?.('[data-testid*="dropzone" i]'),
+    inputEl?.parentElement?.parentElement?.parentElement,
+    inputEl?.parentElement?.parentElement,
+    inputEl?.parentElement
+  ]).filter(Boolean);
+}
+
+const ATTACHMENT_SELS = [
+  'img[src^="blob:"]',
+  'img[src^="data:image"]',
+  'img[src]',
+  'canvas',
+  'video',
+  '[data-testid*="attachment" i]',
+  '[data-testid*="image-preview" i]',
+  '[data-testid*="media-preview" i]',
+  '[data-testid*="file-preview" i]',
+  '[aria-label*="remove attachment" i]',
+  '[aria-label*="remove file" i]',
+  '[aria-label*="remove image" i]',
+  '[class*="attachment" i] img',
+  '[class*="thumbnail" i] img',
+  '[class*="filePreview" i]',
+  '[class*="file-preview" i]',
+  '[class*="image-preview" i]'
+];
+
+function elVisible(el) {
+  try {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) !== 0;
+  } catch { return false; }
+}
+
+function visibleAttachmentMedia(el) {
+  if (!elVisible(el) || !/^(IMG|CANVAS|VIDEO)$/.test(el.tagName)) return false;
+  const r = el.getBoundingClientRect();
+  return r.width >= 24 && r.height >= 24;
+}
+
+function attachmentMediaReady(el) {
+  if (!visibleAttachmentMedia(el)) return false;
+  if (el.tagName === 'IMG') return el.complete && el.naturalWidth > 0;
+  if (el.tagName === 'VIDEO') return el.readyState >= 2;
+  return true;
+}
+
+function leafElements(elements) {
+  return elements.filter(el => !elements.some(other => other !== el && el.contains(other)));
+}
+
+// A provider often exposes one image as a wrapper, thumbnail and remove button.
+// Count the largest category instead of adding those duplicate DOM signals.
+function attachmentState(config, inputEl) {
+  const roots = composerRoots(inputEl);
+  if (!roots.length) return { count: 0, readyCount: 0, removeControls: [] };
+  const sels = config.imagePreviewSels?.length ? config.imagePreviewSels : ATTACHMENT_SELS;
+  const matched = new Set();
+  for (const sel of sels) {
+    try {
+      for (const el of queryAllDeepFromRoots(sel, roots)) {
+        if (elVisible(el)) matched.add(el);
+      }
+    } catch {}
+  }
+
+  const media = new Set();
+  const removeControls = new Set();
+  const wrappers = new Set();
+  for (const el of matched) {
+    if (/^(IMG|CANVAS|VIDEO)$/.test(el.tagName)) media.add(el);
+    for (const child of queryAllDeep('img,canvas,video', el)) media.add(child);
+    if (/\bremove\b.*\b(attachment|file|image|photo)\b/.test(labelFor(el))) {
+      removeControls.add(el);
+    } else if (!/^(IMG|CANVAS|VIDEO)$/.test(el.tagName)) {
+      wrappers.add(el);
+    }
+  }
+
+  const visibleMedia = [...media].filter(visibleAttachmentMedia);
+  const visibleControls = leafElements([...removeControls].filter(elVisible));
+  const visibleWrappers = leafElements([...wrappers].filter(elVisible));
+  const readyMedia = visibleMedia.filter(attachmentMediaReady);
+  const readyWrappers = visibleWrappers.filter(el => {
+    if (el.getAttribute?.('aria-busy') === 'true') return false;
+    const nestedMedia = queryAllDeep('img,canvas,video', el);
+    return !nestedMedia.length || nestedMedia.every(attachmentMediaReady);
+  });
+
+  const count = Math.max(visibleMedia.length, visibleControls.length, visibleWrappers.length);
+  const readyCount = visibleMedia.length
+    ? readyMedia.length
+    : Math.max(visibleControls.length, readyWrappers.length);
+  return { count, readyCount, removeControls: visibleControls };
+}
+
+async function waitForImagesReady(config, inputEl, baseline, expected) {
+  const timeoutMs = config.imageReadyTimeoutMs || Math.min(60000, 25000 + expected * 8000);
+  const started = Date.now();
+  let readySince = 0;
+  while (Date.now() - started < timeoutMs) {
+    const state = attachmentState(config, inputEl);
+    const attached = Math.max(0, state.count - baseline.count);
+    const loaded = Math.max(0, state.readyCount - baseline.readyCount);
+    const ready = attached >= expected && loaded >= expected && !uploadStillBusy(inputEl);
+    if (!ready) {
+      readySince = 0;
+    } else if (!readySince) {
+      readySince = Date.now();
+    } else if (Date.now() - readySince >= 500) {
+      return true;
+    }
+    await sleep(120);
+  }
+  return false;
+}
+
+async function rollbackNewAttachments(config, inputEl, baseline, timeoutMs = 4000) {
+  const baselineControls = new Set(baseline.removeControls || []);
+  const current = attachmentState(config, inputEl);
+  const newControls = (current.removeControls || [])
+    .filter(control => !baselineControls.has(control) && control.isConnected);
+  if (!newControls.length) return false;
+
+  for (const control of newControls.reverse()) {
+    try { clickElement(control); } catch {}
+    await sleep(80);
+  }
+
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const state = attachmentState(config, inputEl);
+    if (state.count <= baseline.count && !uploadStillBusy(inputEl)) return true;
+    await sleep(120);
+  }
+  return false;
+}
+
+// Wait for an existing upload, attach the batch once, then only observe. A failed
+// batch is rolled back only through remove controls that appeared after baseline.
+async function ensureImagesAttached(inputEl, images, config) {
+  const expected = images.length;
+  if (!expected) return { ok: true, mutated: false, rolledBack: true };
+
+  const idle = await waitForComposerUploadIdle(inputEl, config.imagePrePasteTimeoutMs || 30000);
+  if (!idle) return { ok: false, mutated: false, rolledBack: true };
+  const baseline = attachmentState(config, inputEl);
+  const injected = await injectImages(inputEl, images, config);
+  if (!injected) return { ok: false, mutated: false, rolledBack: true };
+
+  const ready = await waitForImagesReady(config, inputEl, baseline, expected);
+  if (ready) return { ok: true, mutated: true, rolledBack: false };
+  const rolledBack = await rollbackNewAttachments(config, inputEl, baseline);
+  return { ok: false, mutated: true, rolledBack };
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,7 +1781,7 @@ function ensureHighlightStyle() {
 }
 
 function flashHighlight(el) {
-  if (!el) return;
+  if (!debugOverlaysEnabled || !el) return;
   try {
     ensureHighlightStyle();
     el.classList.add('aib-target-highlight');
@@ -1315,6 +1806,7 @@ function describeEl(el) {
 // Tiny transient status badge inside each frame so broadcast outcomes are
 // visible at a glance (and screenshot-able) instead of a silent black box.
 function showDebugBadge(message, ok) {
+  if (!debugOverlaysEnabled) return;
   try {
     let badge = document.getElementById('aib-debug-badge');
     if (!badge) {
@@ -1350,56 +1842,301 @@ function clickElement(el) {
 
 function pressEnter(el) {
   focusElement(el);
-  for (const target of uniqueElements([el, document.activeElement, document.body])) {
-    target.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Enter',
-      code: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true,
-      composed: true
-    }));
-    target.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Enter',
-      code: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true,
-      composed: true
-    }));
+  const target = el;
+  target.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'Enter',
+    code: 'Enter',
+    keyCode: 13,
+    which: 13,
+    bubbles: true,
+    cancelable: true,
+    composed: true
+  }));
+  target.dispatchEvent(new KeyboardEvent('keypress', {
+    key: 'Enter',
+    code: 'Enter',
+    keyCode: 13,
+    which: 13,
+    charCode: 13,
+    bubbles: true,
+    cancelable: true,
+    composed: true
+  }));
+  target.dispatchEvent(new KeyboardEvent('keyup', {
+    key: 'Enter',
+    code: 'Enter',
+    keyCode: 13,
+    which: 13,
+    bubbles: true,
+    cancelable: true,
+    composed: true
+  }));
+}
+
+function comparableTextContains(actual, expected) {
+  const actualText = normalizeComparableText(actual);
+  const expectedText = normalizeComparableText(expected);
+  if (!expectedText) return false;
+  if (actualText.includes(expectedText)) return true;
+
+  const head = expectedText.slice(0, Math.min(32, expectedText.length));
+  const tail = expectedText.slice(Math.max(0, expectedText.length - 32));
+  return actualText.includes(head) && actualText.includes(tail);
+}
+
+function userTurnElements(config) {
+  const selectors = uniqueList([...(config.userSels || []), ...COMMON_USER_MESSAGE_SELS]);
+  return uniqueElements(selectors.flatMap(selector => {
+    try { return queryAllDeep(selector); } catch { return []; }
+  })).filter(elVisible);
+}
+
+function imageBearingTurnCount(elements) {
+  return elements.filter(element => {
+    try {
+      return queryAllDeep(
+        'img,canvas,video,[data-testid*="attachment" i],[data-testid*="file" i],[data-testid*="image" i],[class*="attachment" i],[class*="file-preview" i]',
+        element
+      ).some(elVisible);
+    } catch {
+      return false;
+    }
+  }).length;
+}
+
+function assistantState(config) {
+  const selectors = uniqueList([...(config.responseSels || []), ...COMMON_RESPONSE_SELS]);
+  const matches = uniqueElements(selectors.flatMap(selector => {
+    try { return queryAllDeep(selector); } catch { return []; }
+  })).filter(isVisibleWithText);
+  const leaves = matches.filter(element => !matches.some(other => other !== element && element.contains(other)));
+  return {
+    count: (leaves.length ? leaves : matches).length,
+    text: normalizeComparableText(getResponseText())
+  };
+}
+
+function captureSubmitSnapshot(config, inputEl, expectedText) {
+  const users = userTurnElements(config);
+  const assistant = assistantState(config);
+  return {
+    url: location.href,
+    userTurns: users.length,
+    matchingUserTurns: users.filter(element => comparableTextContains(elPlainText(element), expectedText)).length,
+    imageUserTurns: imageBearingTurnCount(users),
+    assistantCount: assistant.count,
+    assistantText: assistant.text,
+    stopVisible: !!findStopButton(config, inputEl?.isConnected ? inputEl : null),
+    composerConnected: !!inputEl?.isConnected,
+    composerContainsText: comparableTextContains(getInputText(inputEl), expectedText),
+    attachments: attachmentState(config, inputEl).count
+  };
+}
+
+function evidenceChanges(baseline, current, payload) {
+  return DELIVERY.diffEvidenceSnapshots(baseline, current, payload);
+}
+
+function openObservationRoots() {
+  const roots = [document];
+  const visit = root => {
+    let elements = [];
+    try { elements = root.querySelectorAll('*'); } catch {}
+    for (const element of elements) {
+      if (!element.shadowRoot || roots.includes(element.shadowRoot)) continue;
+      roots.push(element.shadowRoot);
+      visit(element.shadowRoot);
+    }
+  };
+  visit(document);
+  return roots;
+}
+
+function createMutationWatcher(onMutation) {
+  const observers = new Map();
+  let mutationCount = 0;
+
+  const refresh = () => {
+    for (const root of openObservationRoots()) {
+      if (observers.has(root)) continue;
+      const observer = new MutationObserver(records => {
+        mutationCount += records.length;
+        onMutation();
+      });
+      try {
+        observer.observe(root, { subtree: true, childList: true, characterData: true });
+        observers.set(root, observer);
+      } catch {
+        observer.disconnect();
+      }
+    }
+  };
+
+  refresh();
+  return {
+    refresh,
+    disconnect() {
+      for (const observer of observers.values()) observer.disconnect();
+      observers.clear();
+    },
+    get mutationCount() { return mutationCount; },
+    get rootCount() { return observers.size; }
+  };
+}
+
+async function observeSubmitEvidence(config, inputEl, payload, baseline, timeoutMs, dispatchAction) {
+  const started = Date.now();
+  const recorded = new Map();
+  const weakSince = new Map();
+  let sampleCount = 0;
+  let wake = null;
+  let lastRootRefresh = 0;
+  let lastSampleAt = 0;
+  const watcher = createMutationWatcher(() => wake?.());
+
+  const recordChanges = changes => {
+    const now = Date.now();
+    for (const change of changes) {
+      if (recorded.has(change.type)) continue;
+      if (change.strength === 'weak') {
+        const firstSeen = weakSince.get(change.type) || now;
+        weakSince.set(change.type, firstSeen);
+        if (now - firstSeen < 250) continue;
+      }
+      recorded.set(change.type, {
+        ...change,
+        atMs: now - started
+      });
+    }
+  };
+
+  try {
+    dispatchAction();
+    while (Date.now() - started < timeoutMs) {
+      const sinceLastSample = Date.now() - lastSampleAt;
+      if (sinceLastSample < 180) await sleep(180 - sinceLastSample);
+      lastSampleAt = Date.now();
+      sampleCount += 1;
+      const currentInput = inputEl?.isConnected ? inputEl : findBestInput(config.inputSels);
+      const current = captureSubmitSnapshot(config, currentInput, payload.text);
+      recordChanges(evidenceChanges(baseline, current, {
+        hasText: !!normalizeComparableText(payload.text),
+        hasAttachments: payload.imageCount > 0
+      }));
+
+      const classification = DELIVERY.classifyEvidence([...recorded.values()]);
+      if (classification.outcome === 'verified') {
+        return {
+          ...classification,
+          evidence: [...recorded.values()],
+          samples: sampleCount,
+          mutations: watcher.mutationCount,
+          observedRoots: watcher.rootCount
+        };
+      }
+
+      if (Date.now() - lastRootRefresh >= 1000) {
+        watcher.refresh();
+        lastRootRefresh = Date.now();
+      }
+
+      await new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          wake = null;
+          resolve();
+        };
+        const timer = setTimeout(finish, 120);
+        wake = finish;
+      });
+    }
+
+    const classification = DELIVERY.classifyEvidence([...recorded.values()]);
+    return {
+      ...classification,
+      evidence: [...recorded.values()],
+      samples: sampleCount,
+      mutations: watcher.mutationCount,
+      observedRoots: watcher.rootCount
+    };
+  } finally {
+    watcher.disconnect();
   }
 }
 
-async function clickSubmit(config, inputEl, timeoutMs, text = '') {
+async function prepareSubmitAction(config, inputEl, timeoutMs) {
   const started = Date.now();
-  let btn = null;
-  const needle = text ? text.slice(0, Math.min(24, text.length)) : '';
-
   while (Date.now() - started < timeoutMs) {
-    btn = findSubmitButton(config, inputEl);
-    if (btn && !uploadStillBusy()) {
-      flashHighlight(btn);
-      clickElement(btn);
-      await sleep(300);
-      if (needle && getInputText(inputEl).includes(needle)) pressEnter(inputEl);
-      return true;
+    const button = findSubmitButton(config, inputEl);
+    if (button && !uploadStillBusy(inputEl)) {
+      return { kind: 'click', control: button };
     }
     await sleep(100);
   }
+  return { kind: 'enter', control: null };
+}
 
-  if (btn) {
-    flashHighlight(btn);
-    clickElement(btn);
-    await sleep(300);
-    if (needle && getInputText(inputEl).includes(needle)) pressEnter(inputEl);
-    return true;
+function dispatchSubmitAction(action, inputEl) {
+  if (action.kind === 'click') {
+    flashHighlight(action.control);
+    clickElement(action.control);
+  } else {
+    pressEnter(inputEl);
   }
+}
 
-  pressEnter(inputEl);
-  await sleep(150);
-  return true;
+async function observeResponseCompletion(context, config, inputEl, baselineAssistantText) {
+  const trackerToken = ++responseTrackerToken;
+  const timeoutMs = config.responseCompletionTimeoutMs || 3 * 60 * 1000;
+  const started = Date.now();
+  let lastText = normalizeComparableText(baselineAssistantText);
+  let stableSince = 0;
+  let idleSince = 0;
+  let sawActivity = context.evidence.some(entry =>
+    ['generation_started', 'assistant_activity'].includes(entry.type));
+  let sawStop = context.evidence.some(entry => entry.type === 'generation_started');
+
+  while (trackerToken === responseTrackerToken && Date.now() - started < timeoutMs) {
+    const currentInput = inputEl?.isConnected ? inputEl : findBestInput(config.inputSels);
+    const stopVisible = !!findStopButton(config, currentInput);
+    const responseText = normalizeComparableText(getResponseText());
+
+    if (stopVisible) {
+      sawActivity = true;
+      sawStop = true;
+      idleSince = 0;
+    } else if (sawActivity && !idleSince) {
+      idleSince = Date.now();
+    }
+
+    if (responseText && responseText !== lastText) {
+      sawActivity = true;
+      lastText = responseText;
+      stableSince = Date.now();
+    } else if (sawActivity && responseText && !stableSince) {
+      stableSince = Date.now();
+    }
+
+    const textStable = stableSince && Date.now() - stableSince >= 1500;
+    const generationIdle = idleSince && Date.now() - idleSince >= 1000;
+    if (sawActivity && !stopVisible && generationIdle && (textStable || sawStop)) {
+      chrome.runtime.sendMessage({
+        action: 'telemetryResponseComplete',
+        attemptId: context.attemptId,
+        panelId: context.panelId,
+        panelEpoch: context.panelEpoch,
+        providerKey: context.providerKey,
+        hostname: context.hostname,
+        responseMs: Date.now() - context.startedAt
+      }).catch(() => {});
+      return true;
+    }
+    await sleep(400);
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,9 +2163,12 @@ async function preClickActivate(config) {
 function pageNeedsLogin() {
   // Only flag as login-required when there is no usable chat input AND the page
   // has a visible login/password form (not just header nav buttons like "Sign in").
+  const hasPasswordInput = queryAllDeep('input[type="password"]').some(isUsable);
+  if (hasPasswordInput) return true;
+
   const hasUsableInput = queryAllDeep(
     'textarea,div[contenteditable="true"],[role="textbox"],input[type="text"]'
-  ).some(isUsable);
+  ).some(element => isUsable(element) && !isBadInputCandidate(element));
   if (hasUsableInput) return false;
 
   // Check for a real login form (has a password field or a dedicated sign-in form)
@@ -1440,59 +2180,249 @@ function pageNeedsLogin() {
   return /\b(log in|sign in)\b/.test(text) && /\b(to continue|to access|required)\b/.test(text);
 }
 
+function pageOffersLogin() {
+  return queryAllDeep('a,button,[role="button"]').some(element =>
+    isUsable(element) && /\b(log in|sign in)\b/i.test(labelFor(element)));
+}
+
+function createAttemptContext(data) {
+  const startedAt = Date.now();
+  return {
+    protocolVersion: DELIVERY.VERSION,
+    deliveryId: String(data.deliveryId || `delivery-${startedAt}`),
+    attemptId: String(data.attemptId || `attempt-${startedAt}`),
+    panelId: String(data.panelId || panelBinding.panelId || ''),
+    panelEpoch: Number.isInteger(data.panelEpoch) ? data.panelEpoch : panelBinding.panelEpoch,
+    providerKey: String(data.providerKey || panelBinding.providerKey || ''),
+    isRetry: data.isRetry === true,
+    hostname: location.hostname,
+    startedAt,
+    lifecycle: [],
+    evidence: [],
+    action: {
+      kind: null,
+      dispatched: false,
+      atMs: null,
+      control: null
+    },
+    timings: {
+      startedAt,
+      inputReadyMs: null,
+      textReadyMs: null,
+      imagesReadyMs: null,
+      actionDispatchedMs: null,
+      firstEvidenceMs: null,
+      terminalMs: null,
+      totalMs: null
+    },
+    diagnostics: {
+      hostname: location.hostname,
+      input: '',
+      submit: '',
+      preexisting: {},
+      observer: { samples: 0, mutations: 0, observedRoots: 0 }
+    },
+    attachmentsMutated: false
+  };
+}
+
+function markLifecycle(context, state, details = {}) {
+  const atMs = Date.now() - context.startedAt;
+  context.lifecycle.push({ state, atMs });
+  const timingField = {
+    input_ready: 'inputReadyMs',
+    text_ready: 'textReadyMs',
+    images_ready: 'imagesReadyMs',
+    action_dispatched: 'actionDispatchedMs'
+  }[state];
+  if (timingField && context.timings[timingField] == null) context.timings[timingField] = atMs;
+
+  chrome.runtime.sendMessage({
+    action: 'deliveryLifecycle',
+    protocolVersion: DELIVERY.VERSION,
+    deliveryId: context.deliveryId,
+    attemptId: context.attemptId,
+    panelId: context.panelId,
+    panelEpoch: context.panelEpoch,
+    providerKey: context.providerKey,
+    isRetry: context.isRetry,
+    hostname: context.hostname,
+    state,
+    atMs,
+    details
+  }).catch(() => {});
+}
+
+function finishAttempt(context, outcome, reason, options = {}) {
+  const terminalMs = Date.now() - context.startedAt;
+  context.evidence = options.evidence || context.evidence;
+  context.timings.firstEvidenceMs = context.evidence[0]?.atMs ?? null;
+  context.timings.terminalMs = terminalMs;
+  context.timings.totalMs = terminalMs;
+  if (options.observer) context.diagnostics.observer = options.observer;
+
+  const confidence = options.confidence || (outcome === 'verified' ? 'strong' : 'none');
+  const retry = DELIVERY.deriveRetrySafety({
+    actionDispatched: context.action.dispatched,
+    reason,
+    attachmentsMutated: context.attachmentsMutated
+  });
+  markLifecycle(context, outcome, { reason, confidence });
+
+  return {
+    protocolVersion: DELIVERY.VERSION,
+    deliveryId: context.deliveryId,
+    attemptId: context.attemptId,
+    panelId: context.panelId,
+    panelEpoch: context.panelEpoch,
+    providerKey: context.providerKey,
+    isRetry: context.isRetry,
+    hostname: context.hostname,
+    ok: outcome === 'verified',
+    outcome,
+    confidence,
+    reason,
+    action: context.action,
+    retry,
+    evidence: context.evidence,
+    lifecycle: context.lifecycle,
+    timings: context.timings,
+    diagnostics: context.diagnostics
+  };
+}
+
 async function handleInject(data) {
-  const { text } = data;
+  responseTrackerToken += 1;
+  const context = createAttemptContext(data);
+  const text = String(data.text || '');
   const images = imagePayloadsFromData(data);
   const config = getConfig();
-  if (!config) return { ok: false, hostname: location.hostname, reason: 'no_config:' + location.hostname };
+  markLifecycle(context, 'received');
+
+  const attachmentValidation = DELIVERY.validateAttachments(images);
+  if (!attachmentValidation.ok) {
+    return finishAttempt(context, 'failed', attachmentValidation.reason);
+  }
+
+  if (!config) {
+    return finishAttempt(context, 'failed', `no_config:${location.hostname}`);
+  }
+  if (images.length && config.attachmentsRequireLogin && pageOffersLogin()) {
+    return finishAttempt(context, 'failed', 'login_required');
+  }
+
+  const group = data.group || config.group || 'B';
+  const timeouts = GROUP_TIMEOUTS[group] || GROUP_TIMEOUTS.B;
+  const inputTimeout = timeouts.input;
+  const submitTimeout = images.length
+    ? timeouts.submit * 2 + images.length * 1000
+    : timeouts.submit;
+  const evidenceTimeout = (config.submitEvidenceTimeoutMs || timeouts.evidence)
+    + Math.min(10000, images.length * 2000);
 
   try {
-    // Use group-specific timeouts; fall back to B if group is missing
-    const group = data.group || config.group || 'B';
-    const timeouts = GROUP_TIMEOUTS[group] || GROUP_TIMEOUTS['B'];
-    const inputTimeout  = timeouts.input;
-    const submitTimeout = images.length
-      ? timeouts.submit * 2 + images.length * 1000
-      : timeouts.submit;
-
-    // Copilot and similar shadow-DOM sites need a click to activate the input area
-    if (config.preClick) {
-      await preClickActivate(config);
+    markLifecycle(context, 'preparing');
+    const generationStopped = await stopActiveGeneration(
+      config,
+      findBestInput(config.inputSels)
+    );
+    if (!generationStopped) {
+      showDebugBadge(`${location.hostname}\nactive response did not stop — message not pasted`, false);
+      return finishAttempt(context, 'failed', 'generation_did_not_stop');
     }
+
+    if (config.preClick) await preClickActivate(config);
 
     const input = await waitForInput(config, inputTimeout);
     if (!input) {
-      const reason = pageNeedsLogin() ? 'login_required' : 'no_input';
+      const reason = pageNeedsLogin() ? 'login_required' : `no_input:${location.hostname}`;
       showDebugBadge(`${location.hostname}\n${reason === 'login_required' ? 'needs login' : 'NO input box found'}`, false);
-      return {
-        ok: false,
-        hostname: location.hostname,
-        reason: reason === 'login_required' ? 'login_required' : 'no_input:' + location.hostname
-      };
+      return finishAttempt(context, 'failed', reason);
     }
+
+    context.diagnostics.input = describeEl(input);
+    context.diagnostics.inputSelection = lastInputDiagnostic ? { ...lastInputDiagnostic } : null;
+    context.diagnostics.preexisting = {
+      draftPresent: normalizeComparableText(getInputText(input)).length > 0,
+      attachments: attachmentState(config, input).count,
+      stopVisible: !!findStopButton(config, input)
+    };
+    markLifecycle(context, 'input_ready');
     flashHighlight(input);
 
-    let inserted = true;
     if (text) {
-      inserted = await injectTextReliably(input, text, config.type);
+      markLifecycle(context, 'injecting_text');
+      const inserted = await injectTextReliably(input, text, config.type);
       if (!inserted) {
         showDebugBadge(`${location.hostname}\nfound: ${describeEl(input)}\nbut TEXT DID NOT INSERT`, false);
-        return { ok: false, hostname: location.hostname, reason: 'text_not_inserted' };
+        return finishAttempt(context, 'failed', 'text_not_inserted');
       }
-    }
-    if (images.length) {
-      await injectImages(input, images, config);
-      await waitForImagesReady(config, images.length);
+      markLifecycle(context, 'text_ready');
     }
 
-    const submitted = await clickSubmit(config, input, submitTimeout, text || '');
-    showDebugBadge(
-      `${location.hostname}\ninput: ${describeEl(input)}\ntyped: ${inserted ? 'YES' : 'no'}  sent: ${submitted ? 'YES' : 'no'}`,
-      submitted && inserted
+    if (images.length) {
+      markLifecycle(context, 'attaching');
+      const attachmentResult = await ensureImagesAttached(input, images, config);
+      context.attachmentsMutated = attachmentResult.mutated && !attachmentResult.rolledBack;
+      context.diagnostics.attachments = {
+        requested: images.length,
+        mutated: attachmentResult.mutated,
+        rolledBack: attachmentResult.rolledBack
+      };
+      if (!attachmentResult.ok) {
+        showDebugBadge(`${location.hostname}\nattachment did not become ready — message NOT sent`, false);
+        return finishAttempt(context, 'failed', 'attachment_not_ready');
+      }
+      markLifecycle(context, 'images_ready');
+    }
+
+    const action = await prepareSubmitAction(config, input, submitTimeout);
+    context.action.kind = action.kind;
+    context.action.control = action.control ? describeEl(action.control) : 'composer Enter';
+    context.diagnostics.submit = context.action.control;
+    context.diagnostics.submitSelection = lastSubmitDiagnostic ? { ...lastSubmitDiagnostic } : null;
+    markLifecycle(context, 'action_ready', { kind: action.kind });
+
+    const baseline = captureSubmitSnapshot(config, input, text);
+    markLifecycle(context, 'verifying');
+    const observed = await observeSubmitEvidence(
+      config,
+      input,
+      { text, imageCount: images.length },
+      baseline,
+      evidenceTimeout,
+      () => {
+        dispatchSubmitAction(action, input);
+        context.action.dispatched = true;
+        context.action.atMs = Date.now() - context.startedAt;
+        markLifecycle(context, 'action_dispatched', { kind: action.kind });
+      }
     );
-    return { ok: submitted, hostname: location.hostname, reason: submitted ? '' : 'submit_failed' };
-  } finally {
-    delete document.documentElement.dataset.aibInjecting;
+
+    const observer = {
+      samples: observed.samples,
+      mutations: observed.mutations,
+      observedRoots: observed.observedRoots
+    };
+    const result = finishAttempt(context, observed.outcome, observed.reason, {
+      confidence: observed.confidence,
+      evidence: observed.evidence,
+      observer
+    });
+
+    showDebugBadge(
+      `${location.hostname}\ninput: ${describeEl(input)}\n${result.outcome.toUpperCase()}: ${result.reason}`,
+      result.outcome === 'verified'
+    );
+    if (result.outcome === 'verified') {
+      observeResponseCompletion(context, config, input, baseline.assistantText).catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    showDebugBadge(`${location.hostname}\nINTERNAL ERROR: ${error?.message || error}`, false);
+    return finishAttempt(context, 'failed', 'internal_error', {
+      confidence: 'none'
+    });
   }
 }
 
@@ -1500,46 +2430,133 @@ async function handleInject(data) {
 // Entry point 1: Direct message from background (fast path)
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action !== 'inject') return false;
-  const ts = msg.timestamp || Date.now();
-  if (ts <= window._aibTs) {
-    sendResponse({ ok: false, hostname: location.hostname, reason: 'duplicate' });
-    return false;
+function pruneAttemptCache(now = Date.now()) {
+  for (const [attemptId, entry] of attemptCache) {
+    if (attemptId !== activeAttemptId && now - entry.createdAt > ATTEMPT_CACHE_TTL_MS) {
+      attemptCache.delete(attemptId);
+    }
   }
-  window._aibTs = ts;
-  handleInject(msg)
+  while (attemptCache.size > ATTEMPT_CACHE_LIMIT) {
+    const oldest = [...attemptCache.keys()].find(attemptId => attemptId !== activeAttemptId);
+    if (!oldest) break;
+    attemptCache.delete(oldest);
+  }
+}
+
+function runAttempt(message) {
+  pruneAttemptCache();
+  const attemptId = String(message.attemptId || `${message.deliveryId || 'delivery'}:${Date.now()}`);
+  const cached = attemptCache.get(attemptId);
+  if (cached) return cached.promise;
+
+  if (activeAttemptId && activeAttemptId !== attemptId) {
+    const context = createAttemptContext({ ...message, attemptId });
+    markLifecycle(context, 'received');
+    const promise = Promise.resolve(finishAttempt(context, 'failed', 'frame_busy'));
+    attemptCache.set(attemptId, { createdAt: Date.now(), promise });
+    return promise;
+  }
+
+  activeAttemptId = attemptId;
+  const promise = handleInject({ ...message, attemptId })
+    .finally(() => {
+      if (activeAttemptId === attemptId) activeAttemptId = null;
+      pruneAttemptCache();
+    });
+  attemptCache.set(attemptId, { createdAt: Date.now(), promise });
+  return promise;
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.action !== 'inject') return false;
+  runAttempt(msg)
     .then(result => sendResponse(result))
-    .catch(err   => sendResponse({ ok: false, hostname: location.hostname, reason: String(err) }));
+    .catch(error => sendResponse({
+      protocolVersion: DELIVERY.VERSION,
+      deliveryId: msg.deliveryId || '',
+      attemptId: msg.attemptId || '',
+      panelId: msg.panelId || panelBinding.panelId || '',
+      panelEpoch: msg.panelEpoch ?? panelBinding.panelEpoch,
+      hostname: location.hostname,
+      ok: false,
+      outcome: 'failed',
+      confidence: 'none',
+      reason: error?.message || 'internal_error',
+      retry: { safe: false, reason: 'frame_state_unknown' }
+    }));
   return true;
 });
-
-// ---------------------------------------------------------------------------
-// Entry point 2: Storage broadcast disabled. Popup broadcasts must not touch
-// normal Chrome tabs; background sends direct messages to workspace panels only.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Self-register with background
 // ---------------------------------------------------------------------------
 
-if (isWorkspacePanelFrame()) {
-  chrome.runtime.sendMessage({
+// Register through the extension runtime so background.js receives authoritative
+// tab/frame IDs. A workspace-provided binding adds stable panel identity after
+// each iframe navigation.
+const EXTENSION_ORIGIN = new URL(chrome.runtime.getURL('/')).origin;
+
+function bindingFields() {
+  return {
+    panelId: panelBinding.panelId,
+    panelEpoch: panelBinding.panelEpoch,
+    providerKey: panelBinding.providerKey
+  };
+}
+
+function registerPanel() {
+  return chrome.runtime.sendMessage({
     action: 'register',
     hostname: location.hostname,
-    topLevelFrame: true
-  }).catch(() => {});
-
-  // Tell the workspace (parent) this panel embedded successfully — content.js
-  // only runs if the AI document actually loaded (a blocked frame never gets
-  // here). The workspace uses this to auto-fall-back to a real window only when
-  // a site genuinely refuses to embed. Post a few times: at script run, on full
-  // load, and after a short settle, since SPA hosts hydrate late.
-  const announceAlive = () => {
-    try { window.parent.postMessage({ __aib: 'panel-alive', host: location.hostname }, '*'); } catch {}
-  };
-  announceAlive();
-  window.addEventListener('load', announceAlive);
-  setTimeout(announceAlive, 1500);
+    ...bindingFields()
+  }).catch(() => null);
 }
+
+function announceAlive() {
+  return chrome.runtime.sendMessage({
+    action: 'panelAlive',
+    hostname: location.hostname,
+    ...bindingFields()
+  }).catch(() => null);
+}
+
+registerPanel();
+announceAlive();
+window.addEventListener('load', () => {
+  registerPanel();
+  announceAlive();
+});
+setTimeout(() => {
+  registerPanel();
+  announceAlive();
+}, 1500);
+
+window.addEventListener('message', event => {
+    const data = event.data;
+    if (!data || event.origin !== EXTENSION_ORIGIN) return;
+
+    if (data.__aib === 'panel-binding') {
+      const panelId = typeof data.panelId === 'string' ? data.panelId.slice(0, 160) : '';
+      const panelEpoch = Number(data.panelEpoch);
+      if (!panelId || !Number.isInteger(panelEpoch) || panelEpoch < 1) return;
+      panelBinding = {
+        panelId,
+        panelEpoch,
+        providerKey: typeof data.providerKey === 'string' ? data.providerKey.slice(0, 80) : null
+      };
+      registerPanel();
+      announceAlive();
+      return;
+    }
+
+    if (data.__aib !== 'capture-req') return;
+    let response = { text: '' };
+    try { response = getLatestAssistantResponse(); } catch {}
+    try {
+      window.parent.postMessage(
+        { __aib: 'capture-res', reqId: data.reqId, host: location.hostname, ...response },
+        EXTENSION_ORIGIN
+      );
+    } catch {}
+  });
 // ---------------------------------------------------------------------------

@@ -1,20 +1,80 @@
 'use strict';
 
-importScripts('providers.js');
+importScripts('delivery-protocol.js', 'telemetry.js', 'providers.js');
 
 const AI_HOSTS = new Set(globalThis.AIB_AI_HOSTS || []);
 const WORKSPACE_URL = chrome.runtime.getURL('workspace.html');
-const WORKSPACE_TAB_KEY = 'aib_workspace_tab_id';
+const WORKSPACE_TABS_KEY = 'aib_workspace_tab_ids';
+const LEGACY_WORKSPACE_TAB_KEY = 'aib_workspace_tab_id';
 const STATIC_FRAME_RULESET_ID = 'ai_frame_rules';
 const FRAME_RULE_IDS = [9101, 9102];
 const FRAME_DOMAINS = [...AI_HOSTS];
-const FRAME_ORIGINS = FRAME_DOMAINS.map(domain => `https://${domain}`);
 
-let workspaceTabId = null;
+const workspaceTabIds = new Set();
+let lastWorkspaceTabId = null;
 
-// Build hostname → group map from providers (A / B / C).
-// Each group runs as its own parallel sequence with group-specific timeouts
-// passed in the payload so content.js knows how long to wait.
+const workspacesReady = chrome.storage.session
+  .get([WORKSPACE_TABS_KEY, LEGACY_WORKSPACE_TAB_KEY])
+  .then(stored => {
+    const saved = stored[WORKSPACE_TABS_KEY];
+    if (Array.isArray(saved)) {
+      for (const tabId of saved) if (Number.isInteger(tabId)) workspaceTabIds.add(tabId);
+    }
+    const legacy = stored[LEGACY_WORKSPACE_TAB_KEY];
+    if (Number.isInteger(legacy)) workspaceTabIds.add(legacy);
+    lastWorkspaceTabId = [...workspaceTabIds].at(-1) ?? null;
+  })
+  .catch(() => {});
+let workspaceRegistryQueue = Promise.resolve();
+let telemetryQueue = Promise.resolve();
+
+function mutateTelemetry(mutator) {
+  const task = telemetryQueue.catch(() => {}).then(async () => {
+    const key = globalThis.AIBTelemetry.STORAGE_KEY;
+    const stored = await chrome.storage.local.get(key);
+    const initial = globalThis.AIBTelemetry.normalizeSnapshot(stored[key]);
+    const result = mutator(initial) || { snapshot: initial, recorded: false };
+    if (result.recorded !== false) await chrome.storage.local.set({ [key]: result.snapshot });
+    return result;
+  });
+  telemetryQueue = task;
+  return task;
+}
+
+function recordAttemptTelemetry(panelResults) {
+  return mutateTelemetry(initial => {
+    let snapshot = initial;
+    let recorded = false;
+    for (const result of panelResults || []) {
+      const attempt = result?.attempt || result || {};
+      const diagnostics = attempt.diagnostics || {};
+      const applied = globalThis.AIBTelemetry.applyAttempt(snapshot, {
+        attemptId: attempt.attemptId,
+        providerKey: result?.frame?.providerKey || attempt.providerKey || result?.providerKey,
+        hostname: attempt.hostname || result?.hostname,
+        outcome: attempt.outcome || result?.outcome,
+        reason: attempt.reason || result?.reason,
+        actionKind: attempt.action?.kind || 'none',
+        isRetry: attempt.isRetry === true,
+        acceptanceMs: attempt.timings?.totalMs,
+        inputReadyMs: attempt.timings?.inputReadyMs,
+        inputSelector: diagnostics.inputSelection?.selector,
+        submitSelector: diagnostics.submitSelection?.selector,
+        recordedAt: Date.now()
+      });
+      snapshot = applied.snapshot;
+      recorded = recorded || applied.recorded;
+    }
+    return { snapshot, recorded };
+  });
+}
+
+function recordResponseTelemetry(event) {
+  return mutateTelemetry(snapshot => globalThis.AIBTelemetry.applyResponseComplete(snapshot, event));
+}
+
+// Build the hostname → timeout-tier map from the provider registry. Broadcasts
+// remain concurrent; the tier tells content.js how long a provider may need.
 const HOST_GROUP = new Map();
 for (const provider of globalThis.AIB_PROVIDERS || []) {
   const group = provider.group || 'B';
@@ -36,8 +96,21 @@ async function ensureStaticFrameRuleset() {
   } catch {}
 }
 
-async function ensureFrameRules() {
+let frameRulesPromise = null;
+
+async function installFrameRules() {
   if (!FRAME_DOMAINS.length) return;
+
+  // Do not tear down working global rules every time another workspace opens.
+  // Removing and re-adding them creates a brief gap where a second workspace's
+  // subframes can receive their original anti-embed headers.
+  if (chrome.declarativeNetRequest.getDynamicRules) {
+    try {
+      const existing = await chrome.declarativeNetRequest.getDynamicRules();
+      if (FRAME_RULE_IDS.every(id => existing.some(rule => rule.id === id))) return;
+    } catch {}
+  }
+
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: FRAME_RULE_IDS
   });
@@ -91,67 +164,218 @@ async function ensureFrameRules() {
   } catch {}
 }
 
-async function clearFrameCaches() {
-  if (!FRAME_ORIGINS.length) return;
-  await chrome.browsingData.remove(
-    { origins: FRAME_ORIGINS },
-    { cache: true, cacheStorage: true, serviceWorkers: true }
-  );
+async function ensureFrameRules() {
+  if (frameRulesPromise) return frameRulesPromise;
+  const task = installFrameRules();
+  frameRulesPromise = task;
+  try {
+    await task;
+  } finally {
+    if (frameRulesPromise === task) frameRulesPromise = null;
+  }
 }
 
 async function repairFrameEmbedding() {
   await ensureStaticFrameRuleset();
   await ensureFrameRules();
-  await clearFrameCaches();
+}
+
+let framePreparationQueue = Promise.resolve();
+
+function prepareFrames(origins = []) {
+  const task = framePreparationQueue.catch(() => {}).then(async () => {
+    await ensureStaticFrameRuleset();
+    await ensureFrameRules();
+    if (origins.length) {
+      await chrome.browsingData.remove(
+        { origins: [...new Set(origins)] },
+        { cache: true, cacheStorage: true, serviceWorkers: true }
+      );
+    }
+  });
+  framePreparationQueue = task;
+  return task;
 }
 
 ensureFrameRules().catch(() => {});
 
 function isWorkspaceUrl(value) {
   try {
-    return new URL(value).href === WORKSPACE_URL;
+    const candidate = new URL(value);
+    const workspace = new URL(WORKSPACE_URL);
+    return candidate.origin === workspace.origin && candidate.pathname === workspace.pathname;
   } catch {
-    return value === WORKSPACE_URL;
+    return String(value || '').startsWith(WORKSPACE_URL);
   }
 }
 
-async function openWorkspaceWindow(options = {}) {
-  // The workspace is a single full-page tab embedding every AI panel as an
-  // iframe. Reuse an already-open workspace tab if there is one; otherwise
-  // open a fresh one.
+async function openWorkspaceTab(options = {}) {
+  // Every request creates a distinct workspace. The instance id keeps its title
+  // stable across reloads/browser restore without coupling it to a Chrome tab id.
+  const instanceId = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const url = new URL(WORKSPACE_URL);
+  url.searchParams.set('id', instanceId);
+  const panelCount = Number(options.count);
+  if ([2, 3, 4, 5, 6].includes(panelCount)) url.searchParams.set('count', String(panelCount));
+
+  const tab = await chrome.tabs.create({ url: url.href, active: options.active !== false });
+  if (Number.isInteger(tab.id)) await rememberWorkspaceTab(tab.id);
+  if (options.active !== false) {
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
+  }
+  return { windowId: tab.windowId, tabId: tab.id, instanceId, reused: false };
+}
+
+// Resolve the workspace tab, opening one in the BACKGROUND (no focus steal) if
+// none exists. Used by the hotkey grab so pressing it always has a destination.
+async function ensureWorkspaceTabId() {
   const existing = await findWorkspaceTabId();
   if (Number.isInteger(existing)) {
+    try { await chrome.tabs.get(existing); return existing; }
+    catch { await forgetWorkspaceTab(existing); }
+  }
+  const created = await openWorkspaceTab({ active: false });
+  return created.tabId;
+}
+
+// Deliver a composer payload to the workspace's top frame, retrying while a
+// freshly-opened workspace boots up its scripts.
+async function pushToWorkspace(payload, broadcast = false) {
+  const tabId = await ensureWorkspaceTabId();
+  if (!Number.isInteger(tabId)) throw new Error('no_workspace');
+  let lastErr = null;
+  for (let attempt = 0; attempt < 15; attempt++) {
     try {
-      const tab = await chrome.tabs.get(existing);
-      await chrome.tabs.update(tab.id, { active: true });
-      await chrome.windows.update(tab.windowId, { focused: true });
-      return { windowId: tab.windowId, tabId: tab.id, reused: true };
-    } catch {
-      await forgetWorkspaceTab(existing);
+      const resp = await chrome.tabs.sendMessage(
+        tabId, { action: 'compose-add', broadcast, ...payload }, { frameId: 0 });
+      return { tabId, added: resp?.added ?? true };
+    } catch (err) {
+      lastErr = err;
+      await new Promise(r => setTimeout(r, 300));
     }
   }
+  throw lastErr || new Error('workspace_unreachable');
+}
 
-  const tab = await chrome.tabs.create({ url: WORKSPACE_URL, active: true });
-  if (Number.isInteger(tab.id)) await rememberWorkspaceTab(tab.id);
-  try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
-  return { windowId: tab.windowId, tabId: tab.id, reused: false };
+// ---------------------------------------------------------------------------
+// Grab hotkey — a browser-level chrome.commands shortcut that fires regardless
+// of focused frame. Clipboard data wins; when it is empty, grab.js supplies a
+// hovered image, selection, or nearby semantic text block from the active page.
+// ---------------------------------------------------------------------------
+const OFFSCREEN_URL = 'offscreen.html';
+let creatingOffscreen = null;
+
+async function hasOffscreen() {
+  if (chrome.offscreen?.hasDocument) {
+    try { return await chrome.offscreen.hasDocument(); } catch {}
+  }
+  try {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
+    });
+    return contexts.length > 0;
+  } catch { return false; }
+}
+
+async function ensureOffscreen() {
+  if (await hasOffscreen()) return;
+  if (creatingOffscreen) { await creatingOffscreen; return; }
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: ['CLIPBOARD'],
+    justification: 'Read an image or text from the clipboard for the grab hotkey.'
+  });
+  try { await creatingOffscreen; } catch {} finally { creatingOffscreen = null; }
+}
+
+async function readClipboardViaOffscreen() {
+  try {
+    await ensureOffscreen();
+    return await chrome.runtime.sendMessage({ target: 'offscreen', action: 'read-clipboard' });
+  } catch { return null; }
+}
+
+function clipboardToImage(dataUrl) {
+  const type = (/^data:([^;,]+)/.exec(dataUrl)?.[1]) || 'image/png';
+  const ext = (type.split('/')[1] || 'png').split('+')[0];
+  return { base64: dataUrl, name: `clipboard.${ext}`, type };
+}
+
+function toastActiveTab(tabId, msg, isErr = false) {
+  if (!Number.isInteger(tabId)) return;
+  chrome.tabs.sendMessage(tabId, { action: 'toast', msg, isErr }, { frameId: 0 }).catch(() => {});
+}
+
+async function handleGrabCommand(broadcast) {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const tabId = tab?.id;
+
+  let payload = null;
+  let kind = '';
+
+  // 1) Clipboard first — this is a "paste": whatever you copied wins. Works from
+  //    anywhere, including Google Slides/Docs (offscreen execCommand paste).
+  const cb = await readClipboardViaOffscreen();
+  if (cb?.image) { payload = { images: [clipboardToImage(cb.image)] }; kind = 'Image'; }
+  else if (cb?.text && cb.text.trim()) { payload = { text: cb.text.trim().slice(0, 8000) }; kind = 'Text'; }
+
+  // 2) Fallback when the clipboard is empty — hovered image / selection / block.
+  if (!payload && Number.isInteger(tabId)) {
+    let hover = {};
+    try { hover = await chrome.tabs.sendMessage(tabId, { action: 'grab-hover' }, { frameId: 0 }) || {}; }
+    catch { hover = {}; }
+    if (hover.images?.length) { payload = { images: hover.images }; kind = 'Image'; }
+    else if (hover.selection) { payload = { text: hover.selection }; kind = 'Text'; }
+    else if (hover.block) { payload = { text: hover.block }; kind = 'Text'; }
+  }
+
+  if (!payload) { toastActiveTab(tabId, 'Nothing to paste — copy something first', true); return; }
+
+  try {
+    await pushToWorkspace(payload, broadcast);
+    toastActiveTab(tabId, broadcast ? `${kind} → broadcasting ✓` : `${kind} → composer ✓`);
+  } catch (err) {
+    toastActiveTab(tabId, 'Broadcaster not reachable', true);
+  }
+}
+
+if (chrome.commands?.onCommand) {
+  chrome.commands.onCommand.addListener(command => {
+    if (command === 'grab-to-composer') handleGrabCommand(false).catch(() => {});
+    else if (command === 'grab-and-broadcast') handleGrabCommand(true).catch(() => {});
+  });
 }
 
 async function rememberWorkspaceTab(tabId) {
   if (!Number.isInteger(tabId)) return;
-  workspaceTabId = tabId;
-  await chrome.storage.session.set({ [WORKSPACE_TAB_KEY]: tabId });
+  await workspacesReady;
+  const task = workspaceRegistryQueue.catch(() => {}).then(async () => {
+    workspaceTabIds.add(tabId);
+    lastWorkspaceTabId = tabId;
+    await chrome.storage.session.set({
+      [WORKSPACE_TABS_KEY]: [...workspaceTabIds]
+    });
+  });
+  workspaceRegistryQueue = task;
+  await task;
 }
 
 async function forgetWorkspaceTab(tabId = null) {
-  if (tabId != null) {
-    const currentTabId = Number.isInteger(workspaceTabId)
-      ? workspaceTabId
-      : (await chrome.storage.session.get(WORKSPACE_TAB_KEY))[WORKSPACE_TAB_KEY];
-    if (currentTabId !== tabId) return;
-  }
-  workspaceTabId = null;
-  await chrome.storage.session.remove(WORKSPACE_TAB_KEY);
+  await workspacesReady;
+  const task = workspaceRegistryQueue.catch(() => {}).then(async () => {
+    if (Number.isInteger(tabId)) workspaceTabIds.delete(tabId);
+    else workspaceTabIds.clear();
+    if (lastWorkspaceTabId === tabId || !workspaceTabIds.has(lastWorkspaceTabId)) {
+      lastWorkspaceTabId = [...workspaceTabIds].at(-1) ?? null;
+    }
+    await chrome.storage.session.set({ [WORKSPACE_TABS_KEY]: [...workspaceTabIds] });
+    await chrome.storage.session.remove(LEGACY_WORKSPACE_TAB_KEY);
+  });
+  workspaceRegistryQueue = task;
+  await task;
 }
 
 async function claimWorkspaceTab(tabId) {
@@ -162,42 +386,100 @@ async function claimWorkspaceTab(tabId) {
   return { windowId: tab.windowId, tabId: tab.id };
 }
 
-async function saveFrame(tabId, frameId, hostname, topLevelFrame = true) {
-  const { reg = {} } = await chrome.storage.session.get('reg');
-  reg[`${tabId}:${frameId}`] = { tabId, frameId, hostname, topLevelFrame };
-  await chrome.storage.session.set({ reg });
-}
-
-async function dropTab(tabId) {
-  const { reg = {} } = await chrome.storage.session.get('reg');
-  for (const k of Object.keys(reg)) {
-    if (reg[k].tabId === tabId) delete reg[k];
+async function isWorkspaceTabId(tabId) {
+  if (!Number.isInteger(tabId)) return false;
+  await workspacesReady;
+  if (workspaceTabIds.has(tabId)) return true;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isWorkspaceUrl(tab.url || tab.pendingUrl || '')) return false;
+    await rememberWorkspaceTab(tabId);
+    return true;
+  } catch {
+    return false;
   }
-  await chrome.storage.session.set({ reg });
 }
 
-async function dropFrame(tabId, frameId) {
-  const { reg = {} } = await chrome.storage.session.get('reg');
-  delete reg[`${tabId}:${frameId}`];
-  await chrome.storage.session.set({ reg });
+let frameRegistryQueue = Promise.resolve();
+
+function mutateFrameRegistry(mutator) {
+  const task = frameRegistryQueue.catch(() => {}).then(async () => {
+    const { reg = {} } = await chrome.storage.session.get('reg');
+    mutator(reg);
+    await chrome.storage.session.set({ reg });
+  });
+  frameRegistryQueue = task;
+  return task;
+}
+
+function saveFrame(frame) {
+  return mutateFrameRegistry(reg => {
+    const key = `${frame.tabId}:${frame.frameId}`;
+    const previous = reg[key] || {};
+    reg[key] = {
+      ...previous,
+      ...frame,
+      panelId: frame.panelId || previous.panelId || null,
+      panelEpoch: frame.panelEpoch || previous.panelEpoch || null,
+      providerKey: frame.providerKey || previous.providerKey || null,
+      registeredAt: Date.now()
+    };
+  });
+}
+
+function dropTab(tabId) {
+  return mutateFrameRegistry(reg => {
+    for (const k of Object.keys(reg)) {
+      if (reg[k].tabId === tabId) delete reg[k];
+    }
+  });
+}
+
+function dropFrame(tabId, frameId) {
+  return mutateFrameRegistry(reg => {
+    delete reg[`${tabId}:${frameId}`];
+  });
 }
 
 async function allFrames() {
+  await frameRegistryQueue.catch(() => {});
   const { reg = {} } = await chrome.storage.session.get('reg');
   return Object.values(reg);
 }
 
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  dropTab(tabId);
+async function directWorkspaceFrame(sender, message) {
+  const hostname = message?.hostname;
+  const tabId = sender.tab?.id;
+  const frameId = sender.frameId ?? 0;
+  if (!Number.isInteger(tabId) || frameId === 0 || !AI_HOSTS.has(hostname)) return null;
+  if (!await isWorkspaceTabId(tabId)) return null;
 
-  // If the user closes the login tab themselves, reload the panel anyway so it
-  // picks up the session if they did sign in.
-  const watch = pendingLogins.get(tabId);
-  if (watch) {
-    pendingLogins.delete(tabId);
-    messageWorkspaceTop(watch.workspaceTabId, { action: 'authReloadPanel', host: watch.aiHost, url: watch.aiUrl });
+  try {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId });
+    if (!frame || frame.parentFrameId !== 0) return null;
+    const panelId = typeof message.panelId === 'string' && message.panelId
+      ? message.panelId.slice(0, 160)
+      : null;
+    const panelEpoch = Number(message.panelEpoch);
+    const providerKey = typeof message.providerKey === 'string' && message.providerKey
+      ? message.providerKey.slice(0, 80)
+      : null;
+    return {
+      tabId,
+      frameId,
+      documentId: sender.documentId || null,
+      hostname,
+      panelId,
+      panelEpoch: Number.isInteger(panelEpoch) && panelEpoch > 0 ? panelEpoch : null,
+      providerKey
+    };
+  } catch {
+    return null;
   }
+}
 
+chrome.tabs.onRemoved.addListener(tabId => {
+  dropTab(tabId).catch(() => {});
   for (const key of panelFrameHost.keys()) {
     if (key.startsWith(`${tabId}:`)) panelFrameHost.delete(key);
   }
@@ -209,14 +491,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   claimWorkspaceTab(tabId).catch(() => {});
 });
 
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  isWorkspaceTabId(tabId).then(isWorkspace => {
+    if (isWorkspace) rememberWorkspaceTab(tabId).catch(() => {});
+  }).catch(() => {});
+});
+
 // ---------------------------------------------------------------------------
-// Auth Gateway — logins and OAuth cannot complete inside a cross-origin panel
-// iframe (X-Frame-Options on auth pages, partitioned 3rd-party cookies, OAuth
-// popups). So we detect an auth navigation *inside a direct panel frame*, pop
-// the real login into a top-level focused tab, and reset the panel back to its
-// AI home (aborting the broken in-frame auth load — no error box). Once the
-// login tab returns to the AI's own domain, the first-party session cookie is
-// set; we close the tab and reload the panel, now authenticated.
+// Embedded-auth guard — direct panel frames cannot reliably complete many OAuth
+// flows. When one leaves its provider for an auth host, reset that panel to its
+// provider home instead of leaving a permanently blocked login frame.
 // ---------------------------------------------------------------------------
 
 const AUTH_HOST_PATTERNS = [
@@ -239,20 +523,10 @@ const AUTH_HOST_PATTERNS = [
 
 const AUTH_PATH_PATTERN = /\/(login|signin|sign-in|signup|sign-up|register|oauth|oauth2|authorize|sso|saml)(\/|\?|#|$)/i;
 
-const panelFrameHost = new Map();   // `${tabId}:${frameId}` -> hostname (current panel origin)
-const pendingLogins  = new Map();   // loginTabId -> { aiHost, aiUrl, workspaceTabId }
+const panelFrameHost = new Map(); // `${tabId}:${frameId}` -> current provider hostname
 
 function hostOf(url) {
   try { return new URL(url).hostname; } catch { return ''; }
-}
-
-function registrableDomain(host) {
-  return String(host || '').split('.').slice(-2).join('.');
-}
-
-function hostMatchesAi(host, aiHost) {
-  if (!host || !aiHost) return false;
-  return host === aiHost || registrableDomain(host) === registrableDomain(aiHost);
 }
 
 function isAuthUrl(url, panelHost) {
@@ -278,248 +552,136 @@ function messageWorkspaceTop(tabId, payload) {
   chrome.tabs.sendMessage(tabId, payload, { frameId: 0 }).catch(() => {});
 }
 
-async function resolveWorkspaceTabId() {
-  return Number.isInteger(workspaceTabId) ? workspaceTabId : await findWorkspaceTabId();
+function resetAuthNavigation(tabId, panelHost, authUrl) {
+  const providerUrl = providerUrlForHost(panelHost) || authUrl;
+  messageWorkspaceTop(tabId, {
+    action: 'authResetPanel',
+    host: panelHost,
+    url: providerUrl
+  });
 }
 
-async function openAuthGateway({ tabId, panelHost, authUrl }) {
-  const aiUrl = providerUrlForHost(panelHost) || (panelHost ? `https://${panelHost}/` : authUrl);
-
-  // Reset the panel to its AI home — this aborts the broken in-frame auth load.
-  messageWorkspaceTop(tabId, { action: 'authResetPanel', host: panelHost, url: aiUrl });
-
-  // Open the AI's OWN home page (first-party) — NOT the intercepted mid-flow
-  // auth URL. Auth vendors like Clerk/Auth0 pre-create the sign-in attempt in
-  // the iframe's storage partition; deep-linking that URL into a fresh tab
-  // fails ("authorization_invalid"). Instead the user signs in cleanly here,
-  // and we wait until they've actually passed through an auth step before
-  // reloading the panel.
-  const loginTab = await chrome.tabs.create({ url: aiUrl, active: true }).catch(() => null);
-  if (loginTab && Number.isInteger(loginTab.id)) {
-    pendingLogins.set(loginTab.id, { aiHost: panelHost, aiUrl, workspaceTabId: tabId, sawAuth: false });
-  }
-}
-
-function checkLoginTab(tabId, url) {
-  const watch = pendingLogins.get(tabId);
-  if (!watch) return;
-  const host = hostOf(url);
-  if (!host) return;
-
-  if (isAuthUrl(url, watch.aiHost)) {                // user has entered the auth flow
-    watch.sawAuth = true;
-    return;
-  }
-  if (!watch.sawAuth) return;                        // still on the home page, not logged in yet
-  if (!hostMatchesAi(host, watch.aiHost)) return;    // wandered elsewhere — keep waiting
-
-  // Returned to the AI's own domain after authenticating → first-party session set.
-  pendingLogins.delete(tabId);
-  messageWorkspaceTop(watch.workspaceTabId, { action: 'authReloadPanel', host: watch.aiHost, url: watch.aiUrl });
-  setTimeout(() => chrome.tabs.remove(tabId).catch(() => {}), 700);
-}
-
-chrome.webNavigation.onCommitted.addListener(details => {
-  const { tabId, frameId, parentFrameId, url } = details;
-
-  // Track the live origin of each direct panel frame in the workspace tab.
-  if (frameId !== 0 && parentFrameId === 0 && tabId === workspaceTabId) {
-    panelFrameHost.set(`${tabId}:${frameId}`, hostOf(url));
-  }
-
-  // A login tab landing back on the AI domain = success.
-  if (frameId === 0) checkLoginTab(tabId, url);
-});
-
-chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
-  if (details.frameId === 0) checkLoginTab(details.tabId, details.url);
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, parentFrameId, url }) => {
+  if (frameId === 0 || parentFrameId !== 0) return;
+  isWorkspaceTabId(tabId).then(isWorkspace => {
+    if (!isWorkspace) return;
+    const hostname = hostOf(url);
+    panelFrameHost.set(`${tabId}:${frameId}`, hostname);
+    if (!AI_HOSTS.has(hostname)) dropFrame(tabId, frameId).catch(() => {});
+  }).catch(() => {});
 });
 
 chrome.webNavigation.onBeforeNavigate.addListener(async details => {
   const { tabId, frameId, parentFrameId, url } = details;
   if (frameId === 0 || parentFrameId !== 0) return;  // only direct panel frames
 
-  const wsTabId = await resolveWorkspaceTabId();
-  if (!Number.isInteger(wsTabId) || tabId !== wsTabId) return;
+  if (!await isWorkspaceTabId(tabId)) return;
 
   const panelHost = panelFrameHost.get(`${tabId}:${frameId}`) || '';
   if (!isAuthUrl(url, panelHost)) return;
 
-  openAuthGateway({ tabId, panelHost, authUrl: url });
-});
-
-// ---------------------------------------------------------------------------
-// Tiled real-window panels — each AI opens as its OWN first-party popup window
-// (normal cookies, normal login, no iframe/3rd-party-cookie wall). Broadcasts
-// target these real tabs directly. content.js runs in them unchanged.
-// ---------------------------------------------------------------------------
-
-let panelTabs = [];   // [{ id, windowId, tabId, url, group }]  — id = stable slot index
-
-function groupForUrl(url) {
-  return groupForHostname(hostOf(url));
-}
-
-async function closeAllPanels() {
-  const windowIds = panelTabs.map(p => p.windowId).filter(Number.isInteger);
-  panelTabs = [];
-  for (const windowId of windowIds) {
-    try { await chrome.windows.remove(windowId); } catch {}
-  }
-}
-
-async function createPanelWindow(spec) {
-  const opts = { url: spec.url, type: 'popup', focused: spec.focused === true };
-  if (spec.cell) {
-    opts.left = Math.round(spec.cell.left);
-    opts.top = Math.round(spec.cell.top);
-    opts.width = Math.round(spec.cell.width);
-    opts.height = Math.round(spec.cell.height);
-  }
-  const win = await chrome.windows.create(opts);
-  const tab = win.tabs && win.tabs[0];
-  return {
-    id: spec.id,
-    windowId: win.id,
-    tabId: tab?.id ?? null,
-    url: spec.url,
-    group: spec.group || groupForUrl(spec.url)
-  };
-}
-
-async function launchPanels(specs) {
-  await closeAllPanels();
-  const created = [];
-  for (const spec of specs) {
-    try { created.push(await createPanelWindow(spec)); } catch {}
-  }
-  panelTabs = created;
-  return panelSummary();
-}
-
-async function navigatePanel(id, url) {
-  const panel = panelTabs.find(p => p.id === id);
-  if (!panel || !Number.isInteger(panel.tabId)) return panelSummary();
-  panel.url = url;
-  panel.group = groupForUrl(url);
-  try { await chrome.tabs.update(panel.tabId, { url }); } catch {}
-  return panelSummary();
-}
-
-function panelSummary() {
-  return panelTabs.map(p => ({ id: p.id, url: p.url, windowId: p.windowId, tabId: p.tabId }));
-}
-
-async function focusPanels() {
-  for (const p of panelTabs) {
-    try { await chrome.windows.update(p.windowId, { focused: true, drawAttention: true }); } catch {}
-  }
-}
-
-// Hybrid escape hatch: pop ONE panel slot out into its own real first-party
-// window (normal logged-in cookies, no iframe partition). Reused for login-gated
-// sites that Chrome won't keep authed inside an embedded frame. Broadcasts target
-// these windows via broadcastToPanels() alongside the iframe panels.
-async function openPanelWindow(id, url) {
-  const existing = panelTabs.find(p => p.id === id);
-  if (existing) {
-    try {
-      if (url && existing.url !== url && Number.isInteger(existing.tabId)) {
-        await chrome.tabs.update(existing.tabId, { url });
-        existing.url = url;
-        existing.group = groupForUrl(url);
-      }
-      await chrome.windows.update(existing.windowId, { focused: true, drawAttention: true });
-      return panelSummary();
-    } catch {
-      panelTabs = panelTabs.filter(p => p.id !== id);
-    }
-  }
-  const created = await createPanelWindow({ id, url, focused: true });
-  panelTabs.push(created);
-  return panelSummary();
-}
-
-async function closePanelWindow(id) {
-  const existing = panelTabs.find(p => p.id === id);
-  if (!existing) return panelSummary();
-  panelTabs = panelTabs.filter(p => p.id !== id);
-  try { await chrome.windows.remove(existing.windowId); } catch {}
-  return panelSummary();
-}
-
-async function broadcastToPanels(text, images) {
-  const ts = Date.now();
-  const legacy = firstImageFields(images);
-  const results = await Promise.all(panelTabs.map(async panel => {
-    const hostname = hostOf(panel.url);
-    if (!Number.isInteger(panel.tabId)) return { hostname, ok: false, reason: 'no_tab' };
-    const payload = { action: 'inject', timestamp: ts, text, images, group: panel.group, ...legacy };
-    try {
-      const resp = await chrome.tabs.sendMessage(panel.tabId, payload);
-      return { hostname: resp?.hostname || hostname, ok: !!resp?.ok, reason: resp?.reason || '' };
-    } catch (err) {
-      return { hostname, ok: false, reason: err?.message || 'unreachable' };
-    }
-  }));
-  return { count: results.filter(r => r.ok).length, sent: true, frames: panelTabs.length, results };
-}
-
-chrome.windows.onRemoved.addListener(windowId => {
-  panelTabs = panelTabs.filter(p => p.windowId !== windowId);
+  resetAuthNavigation(tabId, panelHost, url);
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'launchPanels') {
-    launchPanels(msg.specs || [])
-      .then(panels => sendResponse({ ok: true, panels }))
-      .catch(err => sendResponse({ ok: false, reason: err?.message || 'launch_failed' }));
-    return true;
-  }
-
-  if (msg.action === 'navigatePanel') {
-    navigatePanel(msg.id, msg.url)
-      .then(panels => sendResponse({ ok: true, panels }))
-      .catch(err => sendResponse({ ok: false, reason: err?.message || 'navigate_failed' }));
-    return true;
-  }
-
-  if (msg.action === 'getPanels') {
-    sendResponse({ ok: true, panels: panelSummary() });
-    return false;
-  }
-
-  if (msg.action === 'focusPanels') {
-    focusPanels().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
-    return true;
-  }
-
-  if (msg.action === 'openPanelWindow') {
-    openPanelWindow(msg.id, msg.url)
-      .then(panels => sendResponse({ ok: true, panels }))
-      .catch(err => sendResponse({ ok: false, reason: err?.message || 'open_window_failed' }));
-    return true;
-  }
-
-  if (msg.action === 'closePanelWindow') {
-    closePanelWindow(msg.id)
-      .then(panels => sendResponse({ ok: true, panels }))
-      .catch(err => sendResponse({ ok: false, reason: err?.message || 'close_window_failed' }));
-    return true;
-  }
-
-  if (msg.action === 'closePanels') {
-    closeAllPanels().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
-    return true;
-  }
+  const senderWorkspaceId = isWorkspaceUrl(sender.tab?.url || sender.tab?.pendingUrl || '')
+    ? sender.tab.id
+    : null;
+  const requestedWorkspaceId = Number.isInteger(msg.workspaceTabId) ? msg.workspaceTabId : null;
+  const scopedWorkspaceId = senderWorkspaceId || requestedWorkspaceId;
 
   if (msg.action === 'register') {
-    const frameId = sender.frameId ?? 0;
-    const tabId = sender.tab?.id;
-    if (tabId != null && AI_HOSTS.has(msg.hostname)) {
-      saveFrame(tabId, frameId, msg.hostname, msg.topLevelFrame !== false).catch(() => {});
-    }
-    return false;
+    directWorkspaceFrame(sender, msg)
+      .then(async frame => {
+        if (!frame) return false;
+        await saveFrame(frame);
+        return true;
+      })
+      .then(ok => sendResponse({ ok }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.action === 'panelAlive') {
+    directWorkspaceFrame(sender, msg)
+      .then(frame => {
+        if (!frame) return false;
+        messageWorkspaceTop(frame.tabId, {
+          action: 'panelAlive',
+          host: frame.hostname,
+          frameId: frame.frameId,
+          panelId: frame.panelId,
+          panelEpoch: frame.panelEpoch,
+          providerKey: frame.providerKey
+        });
+        return true;
+      })
+      .then(ok => sendResponse({ ok }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.action === 'deliveryLifecycle') {
+    directWorkspaceFrame(sender, msg)
+      .then(frame => {
+        if (!frame) return false;
+        messageWorkspaceTop(frame.tabId, {
+          action: 'deliveryLifecycle',
+          protocolVersion: globalThis.AIBDeliveryProtocol.VERSION,
+          deliveryId: String(msg.deliveryId || ''),
+          attemptId: String(msg.attemptId || ''),
+          panelId: frame.panelId || String(msg.panelId || ''),
+          panelEpoch: frame.panelEpoch || Number(msg.panelEpoch) || null,
+          hostname: frame.hostname,
+          state: String(msg.state || ''),
+          atMs: Number(msg.atMs) || 0,
+          details: msg.details && typeof msg.details === 'object' ? msg.details : {}
+        });
+        return true;
+      })
+      .then(ok => sendResponse({ ok }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.action === 'telemetryResponseComplete') {
+    directWorkspaceFrame(sender, msg)
+      .then(frame => {
+        if (!frame) return { recorded: false };
+        return recordResponseTelemetry({
+          attemptId: String(msg.attemptId || ''),
+          providerKey: frame.providerKey || String(msg.providerKey || ''),
+          hostname: frame.hostname,
+          responseMs: Number(msg.responseMs) || 0
+        });
+      })
+      .then(result => sendResponse({ ok: !!result?.recorded }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.action === 'getTelemetry') {
+    telemetryQueue.catch(() => {}).then(async () => {
+      const key = globalThis.AIBTelemetry.STORAGE_KEY;
+      const stored = await chrome.storage.local.get(key);
+      const snapshot = globalThis.AIBTelemetry.normalizeSnapshot(stored[key]);
+      sendResponse({
+        ok: true,
+        snapshot: globalThis.AIBTelemetry.publicSnapshot(snapshot),
+        ranking: globalThis.AIBTelemetry.rankProviders(snapshot)
+      });
+    }).catch(error => sendResponse({ ok: false, reason: error?.message || 'telemetry_read_failed' }));
+    return true;
+  }
+
+  if (msg.action === 'resetTelemetry') {
+    const snapshot = globalThis.AIBTelemetry.emptySnapshot();
+    const key = globalThis.AIBTelemetry.STORAGE_KEY;
+    const task = telemetryQueue.catch(() => {}).then(() => chrome.storage.local.set({ [key]: snapshot }));
+    telemetryQueue = task;
+    task.then(() => sendResponse({ ok: true })).catch(error =>
+      sendResponse({ ok: false, reason: error?.message || 'telemetry_reset_failed' }));
+    return true;
   }
 
   if (msg.action === 'ensureFrameRules') {
@@ -529,41 +691,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Prepare panel frames before they load: (re)arm the header-stripping rules
-  // AND purge cache + cacheStorage + service workers for the given origins.
-  // The cache purge is ESSENTIAL: an authed AI site (e.g. Venice) serves its
-  // document from a service worker / HTTP cache, which bypasses DNR, so the
-  // original un-stripped frame-ancestors CSP survives and blocks embedding.
-  // Forcing a network fetch lets DNR strip the CSP. Does NOT touch cookies →
-  // logins persist.
   if (msg.action === 'prepareFrames') {
-    (async () => {
-      await ensureStaticFrameRuleset();
-      await ensureFrameRules();
-      const origins = Array.isArray(msg.origins) ? msg.origins.filter(Boolean) : [];
-      if (origins.length) {
-        try {
-          await chrome.browsingData.remove(
-            { origins },
-            { cache: true, cacheStorage: true, serviceWorkers: true }
-          );
-        } catch {}
-      }
-    })()
+    prepareFrames(Array.isArray(msg.origins) ? msg.origins.filter(Boolean) : [])
       .then(() => sendResponse({ ok: true }))
       .catch(err => sendResponse({ ok: false, reason: err?.message || 'prepare_failed' }));
     return true;
   }
 
   if (msg.action === 'openWorkspace') {
-    openWorkspaceWindow()
+    openWorkspaceTab({ count: msg.count })
       .then(result => sendResponse({ ok: true, ...result }))
       .catch(err => sendResponse({ ok: false, reason: err?.message || 'workspace_open_failed' }));
     return true;
   }
 
   if (msg.action === 'claimWorkspace') {
-    claimWorkspaceTab(msg.tabId)
+    claimWorkspaceTab(senderWorkspaceId || msg.tabId)
       .then(result => sendResponse({ ok: !!result, ...result }))
       .catch(err => sendResponse({ ok: false, reason: err?.message || 'workspace_claim_failed' }));
     return true;
@@ -571,17 +714,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action !== 'execute') return false;
   const { text, imageBase64, imageName, imageType } = msg;
-  const images = normalizeImages(msg.images, imageBase64, imageName, imageType);
-  // Inject into BOTH the iframe panels (registered in the workspace tab) AND any
-  // popped-out real windows (login-gated sites). broadcastToPanels() is a no-op
-  // when no panel has been popped out.
-  Promise.all([broadcast(text, images), broadcastToPanels(text, images)])
-    .then(([frameRes, winRes]) => sendResponse({
-      count: (frameRes.count || 0) + (winRes.count || 0),
-      sent: true,
-      frames: (frameRes.frames || 0) + (winRes.frames || 0),
-      results: [...(frameRes.results || []), ...(winRes.results || [])]
-    }))
+  let images;
+  try {
+    images = normalizeImages(msg.images, imageBase64, imageName, imageType);
+  } catch (error) {
+    sendResponse({
+      protocolVersion: globalThis.AIBDeliveryProtocol.VERSION,
+      outcome: 'failed',
+      count: 0,
+      sent: false,
+      frames: 0,
+      results: [],
+      panelResults: [],
+      reason: error?.message || 'invalid_attachment_payload'
+    });
+    return false;
+  }
+  (async () => {
+    const targetWorkspaceId = scopedWorkspaceId || await findWorkspaceTabId();
+    return broadcast(text, images, targetWorkspaceId, {
+      deliveryId: msg.deliveryId,
+      panelAttempts: msg.panelAttempts
+    });
+  })()
+    .then(sendResponse)
     .catch(err => sendResponse({
       count: 0,
       sent: false,
@@ -593,19 +749,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 function normalizeImages(images, imageBase64, imageName, imageType) {
-  if (Array.isArray(images)) {
-    return images
+  const normalized = Array.isArray(images)
+    ? images
       .filter(image => image?.base64)
       .map(image => ({
         base64: image.base64,
-        name: image.name || 'image.png',
-        type: image.type || 'image/png'
-      }));
-  }
+        name: image.name || (image.type === 'application/pdf' ? 'document.pdf' : 'image.png'),
+        type: image.type || 'image/png',
+        size: Number(image.size) || globalThis.AIBDeliveryProtocol.estimatedDataUrlBytes(image.base64)
+      }))
+    : imageBase64
+      ? [{
+        base64: imageBase64,
+        name: imageName || (imageType === 'application/pdf' ? 'document.pdf' : 'image.png'),
+        type: imageType || 'image/png',
+        size: globalThis.AIBDeliveryProtocol.estimatedDataUrlBytes(imageBase64)
+      }]
+      : [];
 
-  return imageBase64
-    ? [{ base64: imageBase64, name: imageName || 'image.png', type: imageType || 'image/png' }]
-    : [];
+  const validation = globalThis.AIBDeliveryProtocol.validateAttachments(normalized);
+  if (!validation.ok) throw new Error(validation.reason);
+  return normalized;
 }
 
 function firstImageFields(images) {
@@ -617,6 +781,30 @@ function firstImageFields(images) {
   };
 }
 
+function sanitizePanelAttempts(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    const panelId = typeof item?.panelId === 'string' ? item.panelId.slice(0, 160) : '';
+    const panelEpoch = Number(item?.panelEpoch);
+    const attemptId = typeof item?.attemptId === 'string' ? item.attemptId.slice(0, 220) : '';
+    if (!panelId || !Number.isInteger(panelEpoch) || panelEpoch < 1 || !attemptId) return [];
+    return [{
+      panelId,
+      panelEpoch,
+      providerKey: typeof item.providerKey === 'string' ? item.providerKey.slice(0, 80) : '',
+      hostname: typeof item.hostname === 'string' ? item.hostname.slice(0, 255) : '',
+      attemptId,
+      isRetry: item.isRetry === true
+    }];
+  });
+}
+
+function createDeliveryId() {
+  return typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `delivery-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function addTarget(targets, target) {
   if (!Number.isInteger(target?.tabId) || !Number.isInteger(target?.frameId) || !target.hostname) {
     return;
@@ -624,14 +812,17 @@ function addTarget(targets, target) {
   targets.set(`${target.tabId}:${target.frameId}`, {
     tabId: target.tabId,
     frameId: target.frameId,
-    hostname: target.hostname
+    documentId: target.documentId || null,
+    hostname: target.hostname,
+    panelId: target.panelId || null,
+    panelEpoch: target.panelEpoch || null,
+    providerKey: target.providerKey || null
   });
 }
 
 async function registeredFrameTargets(scopedTabId) {
   return (await allFrames())
     .filter(frame => scopedTabId == null || frame.tabId === scopedTabId)
-    .filter(frame => frame.topLevelFrame !== false)
     .filter(frame => AI_HOSTS.has(frame.hostname));
 }
 
@@ -643,66 +834,232 @@ async function discoverTargets(scopedTabId) {
 }
 
 async function findWorkspaceTabId() {
-  if (Number.isInteger(workspaceTabId)) return workspaceTabId;
-  const stored = await chrome.storage.session.get(WORKSPACE_TAB_KEY);
-  const tabId = stored[WORKSPACE_TAB_KEY];
-  if (Number.isInteger(tabId)) workspaceTabId = tabId;
-  return Number.isInteger(tabId) ? tabId : null;
+  await workspacesReady;
+
+  // Prefer the most recently focused workspace, then any other live one.
+  const candidates = [lastWorkspaceTabId, ...[...workspaceTabIds].reverse()]
+    .filter((tabId, index, all) => Number.isInteger(tabId) && all.indexOf(tabId) === index);
+  for (const tabId of candidates) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (isWorkspaceUrl(tab.url || tab.pendingUrl || '')) {
+        await rememberWorkspaceTab(tabId);
+        return tabId;
+      }
+    } catch {}
+    workspaceTabIds.delete(tabId);
+  }
+
+  // Recover workspace tabs after service-worker/browser restoration even if
+  // session bookkeeping was lost.
+  try {
+    const tabs = await chrome.tabs.query({});
+    const live = tabs.filter(tab => Number.isInteger(tab.id) && isWorkspaceUrl(tab.url || tab.pendingUrl || ''));
+    for (const tab of live) workspaceTabIds.add(tab.id);
+    const picked = live.find(tab => tab.active)?.id ?? live.at(-1)?.id ?? null;
+    if (Number.isInteger(picked)) {
+      await rememberWorkspaceTab(picked);
+      return picked;
+    }
+  } catch {}
+
+  await chrome.storage.session.set({ [WORKSPACE_TABS_KEY]: [...workspaceTabIds] });
+  lastWorkspaceTabId = null;
+  return null;
 }
 
 async function sendToTarget(target, payload) {
+  const startedAt = Date.now();
   try {
-    const resp = await chrome.tabs.sendMessage(target.tabId, payload, { frameId: target.frameId });
-    return {
-      ...target,
-      hostname: resp?.hostname || target.hostname,
-      ok: !!resp?.ok,
-      reason: resp?.reason || ''
+    const response = await chrome.tabs.sendMessage(target.tabId, payload, { frameId: target.frameId });
+    const attempt = {
+      protocolVersion: globalThis.AIBDeliveryProtocol.VERSION,
+      deliveryId: payload.deliveryId,
+      attemptId: payload.attemptId,
+      panelId: payload.panelId || target.panelId || '',
+      panelEpoch: payload.panelEpoch || target.panelEpoch || null,
+      providerKey: payload.providerKey || target.providerKey || '',
+      isRetry: payload.isRetry === true,
+      hostname: response?.hostname || target.hostname,
+      ...response
     };
-  } catch (err) {
-    await dropFrame(target.tabId, target.frameId);
     return {
-      ...target,
+      panelId: attempt.panelId,
+      panelEpoch: attempt.panelEpoch,
+      hostname: attempt.hostname,
+      ok: attempt.outcome === 'verified',
+      outcome: attempt.outcome || 'failed',
+      reason: attempt.reason || '',
+      retry: attempt.retry || { safe: false, reason: 'frame_state_unknown' },
+      frame: { ...target },
+      transport: {
+        ok: true,
+        durationMs: Date.now() - startedAt,
+        error: null
+      },
+      attempt
+    };
+  } catch (error) {
+    await dropFrame(target.tabId, target.frameId);
+    const reason = error?.message || 'unreachable';
+    const attempt = {
+      protocolVersion: globalThis.AIBDeliveryProtocol.VERSION,
+      deliveryId: payload.deliveryId,
+      attemptId: payload.attemptId,
+      panelId: payload.panelId || target.panelId || '',
+      panelEpoch: payload.panelEpoch || target.panelEpoch || null,
+      providerKey: payload.providerKey || target.providerKey || '',
+      isRetry: payload.isRetry === true,
+      hostname: target.hostname,
       ok: false,
-      reason: err?.message || 'unreachable'
+      outcome: 'failed',
+      confidence: 'none',
+      reason,
+      retry: { safe: false, reason: 'transport_lost_after_dispatch_unknown' }
+    };
+    return {
+      panelId: attempt.panelId,
+      panelEpoch: attempt.panelEpoch,
+      hostname: target.hostname,
+      ok: false,
+      outcome: 'failed',
+      reason,
+      retry: attempt.retry,
+      frame: { ...target },
+      transport: {
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error: reason
+      },
+      attempt
     };
   }
 }
 
-// ---------------------------------------------------------------------------
-// Broadcast — three parallel sequences (A, B, C) fired simultaneously.
-// Each frame receives its group label so content.js can apply the right
-// input/submit timeouts without guessing.
-// ---------------------------------------------------------------------------
+function missingPanelResult(deliveryId, panel) {
+  const attempt = {
+    protocolVersion: globalThis.AIBDeliveryProtocol.VERSION,
+    deliveryId,
+    attemptId: panel.attemptId,
+    isRetry: panel.isRetry === true,
+    panelId: panel.panelId,
+    panelEpoch: panel.panelEpoch,
+    providerKey: panel.providerKey || '',
+    hostname: panel.hostname || '',
+    ok: false,
+    outcome: 'failed',
+    confidence: 'none',
+    reason: 'no_registered_frame',
+    action: { kind: null, dispatched: false, atMs: null, control: null },
+    retry: { safe: true, reason: 'no_submit_action_dispatched' },
+    evidence: [],
+    lifecycle: [],
+    timings: {}
+  };
+  return {
+    panelId: panel.panelId,
+    panelEpoch: panel.panelEpoch,
+    providerKey: panel.providerKey || '',
+    hostname: panel.hostname || '',
+    ok: false,
+    outcome: 'failed',
+    reason: 'no_registered_frame',
+    retry: attempt.retry,
+    frame: null,
+    transport: { ok: false, durationMs: 0, error: 'no_registered_frame' },
+    attempt
+  };
+}
 
-async function broadcast(text, images, targetTabId) {
-  const ts = Date.now();
+// Broadcast to each requested logical panel exactly once. Workspace requests use
+// stable panel IDs; popup requests without panel metadata target every registered
+// direct frame in the selected workspace.
+async function broadcast(text, images, targetTabId, options = {}) {
   const scopedTabId = Number.isInteger(targetTabId) ? targetTabId : await findWorkspaceTabId();
+  const deliveryId = typeof options.deliveryId === 'string' && options.deliveryId
+    ? options.deliveryId.slice(0, 220)
+    : createDeliveryId();
+  const requestedPanels = sanitizePanelAttempts(options.panelAttempts);
   const legacyImageFields = firstImageFields(images);
-  const basePayload = { action: 'inject', timestamp: ts, text, images, ...legacyImageFields };
 
-  if (!Number.isInteger(scopedTabId)) return { count: 0, sent: false, frames: 0, results: [], scoped: false };
-
-  const frames = await discoverTargets(scopedTabId);
-
-  // Partition into three named sequences
-  const seqA = [];
-  const seqB = [];
-  const seqC = [];
-  for (const frame of frames) {
-    const g = groupForHostname(frame.hostname);
-    if      (g === 'A') seqA.push(frame);
-    else if (g === 'C') seqC.push(frame);
-    else                seqB.push(frame);
+  if (!Number.isInteger(scopedTabId)) {
+    const panelResults = requestedPanels.map(panel => missingPanelResult(deliveryId, panel));
+    const summary = globalThis.AIBDeliveryProtocol.summarizeDelivery(panelResults, requestedPanels);
+    await recordAttemptTelemetry(panelResults).catch(() => {});
+    return {
+      ...summary,
+      deliveryId,
+      count: 0,
+      sent: false,
+      frames: 0,
+      results: panelResults,
+      panelResults,
+      scoped: false
+    };
   }
 
-  // Fire all three sequences simultaneously — each frame gets its group tag
-  const results = await Promise.all([
-    ...seqA.map(frame => sendToTarget(frame, { ...basePayload, group: 'A' })),
-    ...seqB.map(frame => sendToTarget(frame, { ...basePayload, group: 'B' })),
-    ...seqC.map(frame => sendToTarget(frame, { ...basePayload, group: 'C' }))
-  ]);
+  const frames = await discoverTargets(scopedTabId);
+  const dispatches = [];
+  const missing = [];
 
-  const count = results.filter(result => result.ok).length;
-  return { count, sent: true, frames: frames.length, results, scoped: scopedTabId != null };
+  if (requestedPanels.length) {
+    for (const panel of requestedPanels) {
+      const frame = frames.find(candidate =>
+        candidate.panelId === panel.panelId && candidate.panelEpoch === panel.panelEpoch);
+      if (!frame) {
+        missing.push(missingPanelResult(deliveryId, panel));
+        continue;
+      }
+      dispatches.push({ frame, panel });
+    }
+  } else {
+    for (const frame of frames) {
+      const panelId = frame.panelId || `frame:${frame.frameId}`;
+      dispatches.push({
+        frame,
+        panel: {
+          panelId,
+          panelEpoch: frame.panelEpoch || 1,
+          providerKey: frame.providerKey || '',
+          hostname: frame.hostname,
+          attemptId: `${deliveryId}:${panelId}:1`,
+          isRetry: false
+        }
+      });
+    }
+  }
+
+  const dispatchedResults = await Promise.all(dispatches.map(({ frame, panel }) => sendToTarget(frame, {
+    action: 'inject',
+    deliveryId,
+    attemptId: panel.attemptId,
+    panelId: panel.panelId,
+    panelEpoch: panel.panelEpoch,
+    providerKey: panel.providerKey,
+    isRetry: panel.isRetry,
+    text,
+    images,
+    group: groupForHostname(frame.hostname),
+    ...legacyImageFields
+  })));
+
+  const panelResults = requestedPanels.length
+    ? requestedPanels.map(panel =>
+      dispatchedResults.find(result => result.panelId === panel.panelId && result.panelEpoch === panel.panelEpoch)
+        || missing.find(result => result.panelId === panel.panelId && result.panelEpoch === panel.panelEpoch))
+    : dispatchedResults;
+  const expectedPanels = requestedPanels.length ? requestedPanels : dispatches.map(item => item.panel);
+  const summary = globalThis.AIBDeliveryProtocol.summarizeDelivery(panelResults, expectedPanels);
+  await recordAttemptTelemetry(panelResults).catch(() => {});
+
+  return {
+    ...summary,
+    deliveryId,
+    count: summary.verified,
+    sent: dispatches.length > 0,
+    frames: dispatches.length,
+    results: panelResults,
+    panelResults,
+    scoped: true
+  };
 }

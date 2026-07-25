@@ -1,5 +1,7 @@
 'use strict';
 
+const DELIVERY = globalThis.AIBDeliveryProtocol;
+const ATTACHMENT_LIMITS = DELIVERY.ATTACHMENT_LIMITS;
 const promptEl = document.getElementById('prompt');
 const voiceBtn = document.getElementById('voiceBtn');
 const voiceStatus = document.getElementById('voiceStatus');
@@ -14,18 +16,16 @@ const statusEl = document.getElementById('status');
 let attachedImages = []; // { id, base64, name, type }
 let nextImageId = 1;
 let isListening = false;
-let workspacePanelCount = 3;
+let workspacePanelCount = 4;
 
 const PANEL_COUNTS = [2, 3, 4, 5, 6];
 const PROVIDERS = globalThis.AIB_PROVIDERS || [];
-const AI_HOSTS = new Set(globalThis.AIB_AI_HOSTS || []);
 const WORKSPACE_DEFAULTS = globalThis.AIB_DEFAULT_PANEL_URLS || [
   'https://gemini.google.com/app',
   'https://chat.deepseek.com/',
   'https://venice.ai/chat/agent',
   'https://chat.mistral.ai/'
 ];
-const WORKSPACE_HOST_PRIORITY = PROVIDERS.flatMap(provider => provider.domains || [provider.domain]);
 
 // Voice input
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -76,16 +76,27 @@ if (SpeechRecognition) {
   voiceBtn.style.cursor = 'not-allowed';
 }
 
-// Image attachment
-function readImageFile(file) {
+// Attachments
+function attachmentErrorMessage(reason) {
+  return {
+    too_many_attachments: `Attach no more than ${ATTACHMENT_LIMITS.maxCount} files.`,
+    attachment_too_large: 'Each attachment must be 20 MB or smaller.',
+    attachment_batch_too_large: 'The combined attachment payload must be 48 MB or smaller.',
+    unsupported_attachment_type: 'Only images and PDF files are supported.',
+    invalid_attachment_data: 'One attachment could not be read safely.'
+  }[reason] || 'Could not attach that file.';
+}
+
+function readAttachmentFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = event => {
       resolve({
         id: nextImageId++,
         base64: event.target.result,
-        name: file.name || 'image.png',
-        type: file.type || 'image/png'
+        name: file.name || (file.type === 'application/pdf' ? 'document.pdf' : 'image.png'),
+        type: file.type || 'application/octet-stream',
+        size: file.size || 0
       });
     };
     reader.onerror = () => reject(reader.error);
@@ -93,16 +104,17 @@ function readImageFile(file) {
   });
 }
 
-function imageFilesFromList(files) {
-  return Array.from(files || []).filter(file => file?.type?.startsWith('image/'));
+function attachmentFilesFromList(files) {
+  return Array.from(files || []).filter(file =>
+    file?.type === 'application/pdf' || file?.type?.startsWith('image/'));
 }
 
-function imageFilesFromClipboard(clipboardData) {
-  const files = imageFilesFromList(clipboardData?.files);
+function attachmentFilesFromClipboard(clipboardData) {
+  const files = attachmentFilesFromList(clipboardData?.files);
   if (files.length) return files;
 
   return Array.from(clipboardData?.items || [])
-    .filter(item => item.type?.startsWith('image/'))
+    .filter(item => item.type === 'application/pdf' || item.type?.startsWith('image/'))
     .map(item => item.getAsFile())
     .filter(Boolean);
 }
@@ -115,11 +127,20 @@ function renderAttachedImages() {
 
   for (const image of attachedImages) {
     const tile = document.createElement('div');
-    tile.className = 'image-tile';
+    tile.className = `image-tile${image.type === 'application/pdf' ? ' is-pdf' : ''}`;
 
-    const img = document.createElement('img');
-    img.src = image.base64;
-    img.alt = image.name;
+    if (image.type === 'application/pdf') {
+      const badge = document.createElement('span');
+      badge.className = 'file-badge';
+      badge.textContent = 'PDF';
+      badge.title = image.name;
+      tile.append(badge);
+    } else {
+      const img = document.createElement('img');
+      img.src = image.base64;
+      img.alt = image.name;
+      tile.append(img);
+    }
 
     const remove = document.createElement('button');
     remove.className = 'remove-btn';
@@ -129,30 +150,53 @@ function renderAttachedImages() {
     remove.dataset.imageId = String(image.id);
     remove.textContent = '×';
 
-    tile.append(img, remove);
+    tile.append(remove);
     imagePreview.append(tile);
   }
 }
 
 async function loadImageFiles(files) {
-  const imageFiles = imageFilesFromList(files);
-  if (imageFiles.length === 0) return;
+  const candidates = attachmentFilesFromList(files);
+  if (!candidates.length) {
+    if (Array.from(files || []).length) showStatus('Only images and PDF files are supported.', 'error');
+    return;
+  }
+  if (attachedImages.length + candidates.length > ATTACHMENT_LIMITS.maxCount) {
+    showStatus(attachmentErrorMessage('too_many_attachments'), 'error');
+    return;
+  }
+  if (candidates.some(file => file.size > ATTACHMENT_LIMITS.maxFileBytes)) {
+    showStatus(attachmentErrorMessage('attachment_too_large'), 'error');
+    return;
+  }
+  const currentBytes = attachedImages.reduce((total, file) =>
+    total + (file.size || DELIVERY.estimatedDataUrlBytes(file.base64)), 0);
+  const incomingBytes = candidates.reduce((total, file) => total + (file.size || 0), 0);
+  if (currentBytes + incomingBytes > ATTACHMENT_LIMITS.maxTotalBytes) {
+    showStatus(attachmentErrorMessage('attachment_batch_too_large'), 'error');
+    return;
+  }
 
-  const images = await Promise.all(imageFiles.map(readImageFile));
-  attachedImages.push(...images);
+  const attachments = await Promise.all(candidates.map(readAttachmentFile));
+  const validation = DELIVERY.validateAttachments([...attachedImages, ...attachments]);
+  if (!validation.ok) {
+    showStatus(attachmentErrorMessage(validation.reason), 'error');
+    return;
+  }
+  attachedImages.push(...attachments);
   imageInput.value = '';
   renderAttachedImages();
 }
 
 function broadcastImages() {
-  return attachedImages.map(({ base64, name, type }) => ({ base64, name, type }));
+  return attachedImages.map(({ base64, name, type, size }) => ({ base64, name, type, size }));
 }
 
 dropZone.addEventListener('click', () => imageInput.click());
 
 imageInput.addEventListener('change', (e) => {
   loadImageFiles(e.target.files).catch(() => {
-    showStatus('Could not load one or more images.', 'error');
+    showStatus('Could not load one or more attachments.', 'error');
   });
 });
 
@@ -169,14 +213,14 @@ dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
   loadImageFiles(e.dataTransfer.files).catch(() => {
-    showStatus('Could not load one or more images.', 'error');
+    showStatus('Could not load one or more attachments.', 'error');
   });
 });
 
-// Also support pasting images directly into the popup
+// Also support pasting attachments directly into the popup
 document.addEventListener('paste', (e) => {
-  loadImageFiles(imageFilesFromClipboard(e.clipboardData)).catch(() => {
-    showStatus('Could not load one or more pasted images.', 'error');
+  loadImageFiles(attachmentFilesFromClipboard(e.clipboardData)).catch(() => {
+    showStatus('Could not load one or more pasted attachments.', 'error');
   });
 });
 
@@ -198,62 +242,34 @@ function showStatus(message, type = 'info') {
 
 function clampPanelCount(value) {
   const n = Number(value);
-  return PANEL_COUNTS.includes(n) ? n : 3;
+  return PANEL_COUNTS.includes(n) ? n : 4;
 }
 
 function renderWorkspacePanelCount() {
   for (const btn of workspacePanelCountEl.querySelectorAll('button')) {
     btn.classList.toggle('active', Number(btn.dataset.count) === workspacePanelCount);
   }
-  workspaceBtn.lastChild.textContent = ` Open ${workspacePanelCount}-Panel Workspace`;
+  workspaceBtn.lastChild.textContent = ` Open New ${workspacePanelCount}-Panel Workspace`;
 }
 
-function aiTabHost(tab) {
-  try {
-    const url = new URL(tab.url);
-    return url.protocol === 'https:' && AI_HOSTS.has(url.hostname) ? url.hostname : '';
-  } catch {
-    return '';
-  }
-}
+function buildWorkspacePanels(count) {
+  const candidates = [
+    ...WORKSPACE_DEFAULTS.map(url => ({ url, title: new URL(url).hostname })),
+    ...PROVIDERS.map(provider => ({ url: provider.url, title: provider.label }))
+  ];
+  const seenHosts = new Set();
+  const panels = [];
 
-function pickWorkspacePanels(tabs, count) {
-  const byHost = new Map();
-
-  for (const tab of tabs) {
-    const host = aiTabHost(tab);
-    if (!host || byHost.has(host)) continue;
-    byHost.set(host, tab);
-  }
-
-  const picked = [];
-  for (const host of WORKSPACE_HOST_PRIORITY) {
-    const tab = byHost.get(host);
-    if (tab) picked.push({ url: tab.url, title: tab.title || host });
-    if (picked.length === count) break;
+  for (const candidate of candidates) {
+    let host;
+    try { host = new URL(candidate.url).hostname; } catch { continue; }
+    if (seenHosts.has(host)) continue;
+    seenHosts.add(host);
+    panels.push(candidate);
+    if (panels.length === count) break;
   }
 
-  for (const url of WORKSPACE_DEFAULTS) {
-    if (picked.length === count) break;
-    const host = new URL(url).hostname;
-    if (!picked.some(panel => {
-      try { return new URL(panel.url).hostname === host; } catch { return false; }
-    })) {
-      picked.push({ url, title: host });
-    }
-  }
-
-  for (const provider of PROVIDERS) {
-    if (picked.length === count) break;
-    const host = new URL(provider.url).hostname;
-    if (!picked.some(panel => {
-      try { return new URL(panel.url).hostname === host; } catch { return false; }
-    })) {
-      picked.push({ url: provider.url, title: provider.label || host });
-    }
-  }
-
-  return picked;
+  return panels;
 }
 
 workspacePanelCountEl.addEventListener('click', async event => {
@@ -275,12 +291,15 @@ workspaceBtn.addEventListener('click', async () => {
   showStatus('Opening workspace...', 'info');
 
   try {
-    const panels = pickWorkspacePanels([], workspacePanelCount);
+    const panels = buildWorkspacePanels(workspacePanelCount);
     await chrome.storage.local.set({
       aib_workspace_seed: { timestamp: Date.now(), panels, count: workspacePanelCount },
       aib_workspace_panel_count: workspacePanelCount
     });
-    const result = await chrome.runtime.sendMessage({ action: 'openWorkspace' });
+    const result = await chrome.runtime.sendMessage({
+      action: 'openWorkspace',
+      count: workspacePanelCount
+    });
     if (!result?.ok) throw new Error(result?.reason || 'Could not open workspace');
     showStatus('Workspace opened.', 'success');
   } catch (err) {
@@ -299,22 +318,19 @@ promptEl.addEventListener('keydown', event => {
 
 // Broadcast
 broadcastBtn.addEventListener('click', async () => {
-  const text = promptEl.value.trim();
+  const promptSnapshot = promptEl.value;
+  const text = promptSnapshot.trim();
+  const imageIds = attachedImages.map(image => image.id);
   const images = broadcastImages();
 
   if (!text && images.length === 0) {
-    showStatus('Enter a prompt or attach an image first.', 'error');
+    showStatus('Enter a prompt or attach a file first.', 'error');
     return;
   }
 
   broadcastBtn.disabled = true;
   broadcastBtn.textContent = 'Sending...';
   showStatus('Broadcasting...', 'info');
-
-  // Clear immediately so the box feels instant
-  promptEl.value = '';
-  attachedImages = [];
-  renderAttachedImages();
 
   try {
     const response = await chrome.runtime.sendMessage({
@@ -325,18 +341,24 @@ broadcastBtn.addEventListener('click', async () => {
       imageName:   images[0]?.name   || null,
       imageType:   images[0]?.type   || null
     });
-    const n      = response?.count  ?? 0;
-    const sent   = response?.sent   ?? false;
-    const frames = response?.frames ?? 0;
+    const outcome = response?.outcome || 'failed';
+    const verified = response?.verified ?? response?.count ?? 0;
+    const expected = response?.expected ?? response?.frames ?? 0;
 
-    if (n > 0) {
-      showStatus(`Sent to ${n} AI panel${n === 1 ? '' : 's'}!`, 'success');
-    } else if (sent && frames > 0) {
-      showStatus(`Reached ${frames} panel${frames === 1 ? '' : 's'} — check for responses.`, 'info');
-    } else if (sent) {
-      showStatus('Broadcast sent — reload your PageVS tab once if no response.', 'info');
+    if (outcome === 'verified' && expected > 0) {
+      if (promptEl.value === promptSnapshot) promptEl.value = '';
+      const deliveredIds = new Set(imageIds);
+      attachedImages = attachedImages.filter(image => !deliveredIds.has(image.id));
+      renderAttachedImages();
+      showStatus(`Verified by all ${verified} panel${verified === 1 ? '' : 's'}.`, 'success');
+    } else if (outcome === 'partial') {
+      showStatus(`${verified}/${expected} panels verified. Draft retained for inspection.`, 'error');
+    } else if (outcome === 'unverified') {
+      showStatus('Submission was dispatched but could not be verified. Draft retained.', 'error');
+    } else if (outcome === 'no_targets') {
+      showStatus('No ready workspace panels were found. Draft retained.', 'error');
     } else {
-      showStatus('Error sending broadcast.', 'error');
+      showStatus('Delivery failed. Draft retained.', 'error');
     }
   } catch (err) {
     showStatus('Error: ' + (err.message || 'Unknown error'), 'error');

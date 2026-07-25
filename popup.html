@@ -17,7 +17,7 @@
     <div class="prompt-section">
       <div class="textarea-wrap">
         <textarea id="prompt" placeholder="Type your prompt, or click the mic to speak..." rows="7" spellcheck="true"></textarea>
-        <div id="imagePreview" class="image-preview hidden" aria-label="Attached images"></div>
+        <div id="imagePreview" class="image-preview hidden" aria-label="Attached files"></div>
         <button id="voiceBtn" class="voice-btn" title="Voice input">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
@@ -32,11 +32,11 @@
 
     <div class="image-section">
       <div id="dropZone" class="drop-zone">
-        <input type="file" id="imageInput" accept="image/*" multiple hidden>
+        <input type="file" id="imageInput" accept="image/*,application/pdf" multiple hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="attach-icon">
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
         </svg>
-        <span>Attach images (click, drag, or paste)</span>
+        <span>Attach images or PDFs (click, drag, or paste)</span>
       </div>
     </div>
 
@@ -64,12 +64,13 @@
         <line x1="9" y1="4" x2="9" y2="20"/>
         <line x1="15" y1="4" x2="15" y2="20"/>
       </svg>
-      Open Workspace
+      Open New Workspace
     </button>
 
     <div id="status" class="status hidden"></div>
   </div>
 
+  <script src="delivery-protocol.js"></script>
   <script src="providers.js"></script>
   <script src="popup.js"></script>
 </body>

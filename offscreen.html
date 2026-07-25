@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+  <!-- Hidden paste sink. execCommand('paste') into this contenteditable lets the
+       extension read image/text off the clipboard with the clipboardRead
+       permission, without any page focus or user gesture. -->
+  <div id="sink" contenteditable="true"
+       style="position:fixed;left:-9999px;top:0;width:10px;height:10px;"></div>
+  <script src="offscreen.js"></script>
+</body>
+</html>

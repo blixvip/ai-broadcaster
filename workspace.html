@@ -9,35 +9,90 @@
 </head>
 <body>
   <main class="workspace">
-    <!-- Live AI panels (iframes) tiled side by side in ONE page -->
-    <section class="grid" id="grid" aria-label="AI panels"></section>
+    <header class="workspace-bar">
+      <div class="product-brand" aria-label="AI Broadcaster">
+        <span class="brand-mark"><img src="icons/icon32.png" alt=""></span>
+        <span class="brand-copy">
+          <strong>AI BROADCASTER</strong>
+          <small>MULTI-MODEL WORKSPACE</small>
+        </span>
+      </div>
 
-    <!-- Floating fullscreen toggle, top-right corner -->
-    <button type="button" class="fs-btn" id="fsBtn" title="Toggle fullscreen" aria-label="Toggle fullscreen">⤢</button>
+      <label class="workspace-identity" for="workspaceTitle">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.8 6.8A1.8 1.8 0 0 1 5.6 5h4l2 2h6.8a1.8 1.8 0 0 1 1.8 1.8v8.6a1.8 1.8 0 0 1-1.8 1.8H5.6a1.8 1.8 0 0 1-1.8-1.8V6.8Z"/></svg>
+        <input id="workspaceTitle" class="workspace-title" type="text" maxlength="80"
+          placeholder="Name this workspace…" aria-label="Workspace title">
+      </label>
+
+      <div class="toolbar-actions">
+        <span class="panel-readout" id="panelReadout">04 PANELS</span>
+        <button type="button" class="toolbar-btn dashboard-btn" id="dashboardBtn" title="Open Smart Rank dashboard">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V10M10 19V5M16 19v-7M22 19V8"/></svg>
+          <span>INSIGHTS</span>
+        </button>
+        <button type="button" class="toolbar-btn focus-btn" id="focusModeBtn"
+          title="Dim panels you are not working in" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+          <span>FOCUS</span>
+        </button>
+        <button type="button" class="toolbar-btn new-workspace-btn" id="newWorkspaceBtn"
+          title="Open another independent AI Broadcaster workspace">
+          <span class="plus">+</span><span>NEW WORKSPACE</span>
+        </button>
+        <button type="button" class="toolbar-btn fs-btn" id="fsBtn" title="Toggle fullscreen" aria-label="Toggle fullscreen">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 0 1-1v-4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="grid-shell">
+      <div class="grid-stage" id="gridShell">
+        <!-- Live AI panels (iframes) tiled side by side in ONE page -->
+        <section class="grid" id="grid" aria-label="AI panels"></section>
+        <button type="button" class="split-handle split-handle-x" id="splitHandleX" aria-label="Resize panel columns"><span></span></button>
+        <button type="button" class="split-handle split-handle-y" id="splitHandleY" aria-label="Resize panel rows"><span></span></button>
+        <span class="split-node" id="splitNode" aria-hidden="true"></span>
+      </div>
+    </div>
 
     <!-- Bottom dock: panel count + composer -->
     <footer class="dock">
-      <div class="count" id="panelCount" role="group" aria-label="Panel count">
-        <button type="button" data-count="2">02</button>
-        <button type="button" data-count="3">03</button>
-        <button type="button" data-count="4">04</button>
-        <button type="button" data-count="5">05</button>
-        <button type="button" data-count="6">06</button>
+      <div class="layout-control">
+        <span class="dock-label">LAYOUT</span>
+        <div class="count" id="panelCount" role="group" aria-label="Panel count">
+          <button type="button" data-count="2">02</button>
+          <button type="button" data-count="3">03</button>
+          <button type="button" data-count="4">04</button>
+          <button type="button" data-count="5">05</button>
+          <button type="button" data-count="6">06</button>
+        </div>
       </div>
 
+      <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
+
       <form id="composer" class="composer">
-        <button type="button" class="icon-btn" id="attachBtn" title="Attach images" aria-label="Attach images">+</button>
-        <input id="imageInput" type="file" accept="image/*" multiple hidden>
+        <div class="broadcast-live" title="Broadcast channel ready">
+          <span class="live-dot"></span>
+          <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+        </div>
+        <button type="button" class="icon-btn" id="attachBtn" title="Attach images or PDFs" aria-label="Attach images or PDFs">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.2 8.2a5.4 5.4 0 0 1-7.6-7.6l9-9a3.7 3.7 0 0 1 5.3 5.3l-9 9a2.1 2.1 0 0 1-3-3l8.2-8.2"/></svg>
+        </button>
+        <input id="imageInput" type="file" accept="image/*,application/pdf" multiple hidden>
         <div class="image-strip" id="imageStrip"></div>
-        <textarea id="prompt" rows="1" placeholder="broadcast message…"
+        <textarea id="prompt" rows="1" placeholder="Broadcast a message to every active model…"
           spellcheck="true" aria-label="Broadcast message"></textarea>
-        <button id="sendBtn" class="send-btn" type="submit" aria-label="Broadcast to all panels">SEND</button>
+        <span class="send-hint">ENTER</span>
+        <button id="sendBtn" class="send-btn" type="submit" aria-label="Broadcast to all panels">
+          <span>SEND</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 13-7-4 14-3-5-6-2Z"/><path d="m11 14 7-9"/></svg>
+        </button>
       </form>
     </footer>
-
-    <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
 
+  <script src="delivery-protocol.js"></script>
+  <script src="provider-marks.js"></script>
   <script src="providers.js"></script>
   <script src="workspace.js"></script>
 </body>

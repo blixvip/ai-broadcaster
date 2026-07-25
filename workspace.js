@@ -9,14 +9,28 @@
 // receives the inject payload from background.broadcast().
 // ---------------------------------------------------------------------------
 
+const DELIVERY = globalThis.AIBDeliveryProtocol;
+const ATTACHMENT_LIMITS = DELIVERY.ATTACHMENT_LIMITS;
 const PROVIDERS = globalThis.AIB_PROVIDERS || [];
 const DEFAULT_PANEL_URLS = globalThis.AIB_DEFAULT_PANEL_URLS || [];
 const PANEL_COUNTS = [2, 3, 4, 5, 6];
-const DEFAULT_COUNT = 3;
-const EMBED_TIMEOUT_MS = 10000;   // how long to wait for a panel to load embedded before falling back to a real window
+const DEFAULT_COUNT = 4;
+const EMBED_TIMEOUT_MS = 20000;   // slow provider SPAs may need extra time in a fresh workspace
+const WORKSPACE_PARAMS = new URLSearchParams(location.search);
+const WORKSPACE_INSTANCE_ID = WORKSPACE_PARAMS.get('id') || (() => {
+  const id = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const url = new URL(location.href);
+  url.searchParams.set('id', id);
+  history.replaceState(null, '', url.href);
+  return id;
+})();
+const WORKSPACE_TITLE_KEY = `aib_workspace_title_${WORKSPACE_INSTANCE_ID}`;
+const WORKSPACE_LAYOUT_KEY = `aib_workspace_layout_${WORKSPACE_INSTANCE_ID}`;
 
-// Each panel registers a monitor here so the global 'panel-alive' listener can
-// notify it when content.js confirms the site loaded inside its iframe.
+// Each panel registers a readiness monitor. background.js forwards trusted
+// content-script `panelAlive` messages to the owning workspace tab.
 let panelMonitors = [];
 
 // Providers that land on a usable chat without a signup/landing wall.
@@ -24,7 +38,16 @@ const CLEAN_KEYS = new Set(['gemini', 'mistral', 'grok', 'perplexity', 'you', 'd
 
 const el = {
   grid:       document.getElementById('grid'),
+  gridShell:  document.getElementById('gridShell'),
+  splitX:     document.getElementById('splitHandleX'),
+  splitY:     document.getElementById('splitHandleY'),
+  splitNode:  document.getElementById('splitNode'),
   fsBtn:      document.getElementById('fsBtn'),
+  dashboard:  document.getElementById('dashboardBtn'),
+  focusMode:  document.getElementById('focusModeBtn'),
+  panelReadout: document.getElementById('panelReadout'),
+  title:      document.getElementById('workspaceTitle'),
+  newWorkspace: document.getElementById('newWorkspaceBtn'),
   panelCount: document.getElementById('panelCount'),
   composer:   document.getElementById('composer'),
   prompt:     document.getElementById('prompt'),
@@ -39,6 +62,66 @@ let count = DEFAULT_COUNT;
 let selectedKeys = [];            // provider key per panel slot (index = panel id)
 let attachedImages = [];
 let nextImageId = 1;
+let workspaceTabId = null;
+let focusModeEnabled = false;
+let focusedPanelId = 0;
+let splitX = 0.5;
+let splitY = 0.5;
+let splitRenderFrame = null;
+let draftRevision = 0;
+let activeDelivery = null;
+const panelControllers = new Map();
+
+function createId(prefix) {
+  const value = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${value}`;
+}
+
+function markDraftChanged() {
+  draftRevision += 1;
+}
+
+function sendWorkspaceMessage(message) {
+  return chrome.runtime.sendMessage({
+    ...message,
+    workspaceTabId
+  });
+}
+
+function setFocusedPanel(id) {
+  focusedPanelId = Number(id) || 0;
+  for (const panel of el.grid.querySelectorAll('.panel')) {
+    panel.classList.toggle('is-focused', Number(panel.dataset.id) === focusedPanelId);
+  }
+}
+
+function renderFocusMode() {
+  document.documentElement.classList.toggle('focus-mode', focusModeEnabled);
+  el.focusMode.classList.toggle('active', focusModeEnabled);
+  el.focusMode.setAttribute('aria-pressed', String(focusModeEnabled));
+  setFocusedPanel(focusedPanelId < count ? focusedPanelId : 0);
+}
+
+function writeGridSplit() {
+  el.gridShell.style.setProperty('--split-x', `${(splitX * 100).toFixed(2)}%`);
+  el.gridShell.style.setProperty('--split-y', `${(splitY * 100).toFixed(2)}%`);
+}
+
+function applyGridSplit() {
+  if (splitRenderFrame != null) return;
+  splitRenderFrame = requestAnimationFrame(() => {
+    splitRenderFrame = null;
+    writeGridSplit();
+  });
+}
+
+function flushGridSplit() {
+  if (splitRenderFrame != null) cancelAnimationFrame(splitRenderFrame);
+  splitRenderFrame = null;
+  writeGridSplit();
+}
 
 // ---------------------------------------------------------------------------
 // Provider helpers
@@ -47,20 +130,41 @@ function providerByKey(key) { return PROVIDERS.find(p => p.key === key) || PROVI
 function urlForKey(key) { return providerByKey(key)?.url; }
 
 function originsForKey(key) {
-  const p = providerByKey(key);
-  return (p.domains || [p.domain]).filter(Boolean).map(d => `https://${d}`);
+  const provider = providerByKey(key);
+  return (provider.domains || [provider.domain]).filter(Boolean).map(domain => `https://${domain}`);
 }
 
-// Purge the panel origins' cache + service worker (via background) BEFORE loading,
-// then arm the DNR rules. Essential: authed AI sites (Venice) serve their document
-// from a service worker / HTTP cache that bypasses DNR, so the un-stripped
-// frame-ancestors CSP survives and blocks embedding. Forcing a network fetch lets
-// DNR strip it. Cookies are untouched → logins persist.
-async function prepareOrigins(origins) {
+const PROVIDER_ACCENTS = {
+  gemini: '#72a7ff', deepseek: '#6b8cff', mistral: '#ff9d66', grok: '#f4f6fb',
+  perplexity: '#5eead4', you: '#b78cff', duckai: '#ffb454', huggingchat: '#ffd166',
+  poe: '#8b7cff', venice: '#53e6c2', lmarena: '#69d2ff', 'ai-studio': '#78a8ff',
+  copilot: '#67e8f9', qwen: '#9b87ff', meta: '#5b8cff', kimi: '#64f0c8', blackbox: '#e7e9ee'
+};
+
+function providerAccent(key) {
+  return PROVIDER_ACCENTS[key] || '#66fcf1';
+}
+
+function providerMark(key) {
+  return globalThis.AIB_PROVIDER_MARK?.(key) || '';
+}
+
+function makePanelButton(className, title, svg) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  button.innerHTML = svg;
+  return button;
+}
+
+// Ensure frame rules are active and cached anti-embed responses are removed.
+async function prepareFrames(origins = []) {
   try {
     await Promise.race([
       chrome.runtime.sendMessage({ action: 'prepareFrames', origins: [...new Set(origins)] }),
-      new Promise(r => setTimeout(r, 6000))
+      new Promise(resolve => setTimeout(resolve, 6000))
     ]);
   } catch {}
 }
@@ -75,13 +179,6 @@ function hostMatch(a, b) {
   const reg = h => h.split('.').slice(-2).join('.');
   return reg(a) === reg(b);
 }
-
-// content.js in a successfully-embedded panel posts {__aib:'panel-alive'} to us.
-window.addEventListener('message', event => {
-  const data = event.data;
-  if (!data || data.__aib !== 'panel-alive' || !data.host) return;
-  for (const monitor of panelMonitors) monitor.notifyAlive(data.host);
-});
 
 function keyFromUrl(url) {
   if (!url) return null;
@@ -119,24 +216,328 @@ function randomKeys(n) {
 
 function showStatus(message, type = '') {
   el.status.textContent = message;
+  el.status.title = message;
   el.status.className = `status ${type}`.trim();
+}
+
+function applyWorkspaceTitle(value, syncInput = true) {
+  const title = String(value || '').trim().slice(0, 80);
+  if (syncInput) el.title.value = title;
+  document.title = title ? `${title} — AI Broadcaster` : 'AI Broadcaster — Untitled';
+}
+
+async function saveWorkspaceTitle() {
+  const title = el.title.value.trim().slice(0, 80);
+  applyWorkspaceTitle(title);
+  if (title) await chrome.storage.local.set({ [WORKSPACE_TITLE_KEY]: title });
+  else await chrome.storage.local.remove(WORKSPACE_TITLE_KEY);
+}
+
+async function loadWorkspaceTitle() {
+  try {
+    const stored = await chrome.storage.local.get(WORKSPACE_TITLE_KEY);
+    applyWorkspaceTitle(stored[WORKSPACE_TITLE_KEY] || '');
+  } catch {
+    applyWorkspaceTitle('');
+  }
+}
+
+async function loadWorkspaceLayout() {
+  try {
+    const stored = await chrome.storage.local.get(WORKSPACE_LAYOUT_KEY);
+    const layout = stored[WORKSPACE_LAYOUT_KEY];
+    if (Number.isFinite(layout?.x)) splitX = Math.min(0.72, Math.max(0.28, layout.x));
+    if (Number.isFinite(layout?.y)) splitY = Math.min(0.72, Math.max(0.28, layout.y));
+  } catch {}
+  flushGridSplit();
+}
+
+function saveWorkspaceLayout() {
+  return chrome.storage.local.set({ [WORKSPACE_LAYOUT_KEY]: { x: splitX, y: splitY } });
+}
+
+// ---------------------------------------------------------------------------
+// "→ Warp": capture a panel's latest response and paste it into Warp.
+// Chrome launches the registered native host on demand, so there is no local
+// server to start and no localhost endpoint exposed to ordinary web pages.
+// ---------------------------------------------------------------------------
+const WARP_NATIVE_HOST = 'com.ai_broadcaster.warp';
+let captureSeq = 0;
+const pendingCaptures = new Map();   // reqId -> { resolve, timer }
+let warpTransferBusy = false;
+
+// content.js in a panel frame replies to our capture-req with this.
+window.addEventListener('message', event => {
+  const d = event.data;
+  if (!d || d.__aib !== 'capture-res') return;
+  const pending = pendingCaptures.get(d.reqId);
+  if (!pending) return;
+  if (event.source !== pending.source) return;
+  clearTimeout(pending.timer);
+  pendingCaptures.delete(d.reqId);
+  pending.resolve({ text: d.text || '' });
+});
+
+// Ask an embedded panel iframe for only its newest assistant response.
+function captureFromFrame(frame, timeoutMs = 1000) {
+  return new Promise(resolve => {
+    const reqId = `cap-${Date.now()}-${captureSeq++}`;
+    const timer = setTimeout(() => {
+      pendingCaptures.delete(reqId);
+      resolve({ text: '' });
+    }, timeoutMs);
+    pendingCaptures.set(reqId, { resolve, timer, source: frame.contentWindow });
+    try {
+      frame.contentWindow.postMessage({ __aib: 'capture-req', reqId }, '*');
+    } catch {
+      clearTimeout(timer);
+      pendingCaptures.delete(reqId);
+      resolve({ text: '' });
+    }
+  });
+}
+
+// Keep one native connection warm. The helper is started while the workspace
+// loads, so button clicks do not pay process-startup cost.
+let warpNativePort = null;
+let warpNativeSeq = 0;
+const pendingNativeMessages = new Map();
+
+function connectWarpNative() {
+  if (warpNativePort) return warpNativePort;
+  const port = chrome.runtime.connectNative(WARP_NATIVE_HOST);
+  warpNativePort = port;
+
+  port.onMessage.addListener(response => {
+    let requestId = response?.requestId;
+    // Compatibility with a one-shot helper during extension upgrades.
+    if (!requestId && pendingNativeMessages.size === 1) {
+      requestId = pendingNativeMessages.keys().next().value;
+    }
+    const pending = pendingNativeMessages.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingNativeMessages.delete(requestId);
+    pending.resolve(response);
+  });
+
+  port.onDisconnect.addListener(() => {
+    const message = chrome.runtime.lastError?.message || 'Warp helper disconnected';
+    if (warpNativePort === port) warpNativePort = null;
+    for (const pending of pendingNativeMessages.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(message));
+    }
+    pendingNativeMessages.clear();
+  });
+  return port;
+}
+
+function sendWarpNativeMessage(message, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    const requestId = `native-${Date.now()}-${warpNativeSeq++}`;
+    const timer = setTimeout(() => {
+      pendingNativeMessages.delete(requestId);
+      reject(new Error('Warp helper timed out'));
+    }, timeoutMs);
+    pendingNativeMessages.set(requestId, { resolve, reject, timer });
+    try {
+      connectWarpNative().postMessage({ ...message, requestId });
+    } catch (err) {
+      clearTimeout(timer);
+      pendingNativeMessages.delete(requestId);
+      reject(err);
+    }
+  });
+}
+
+// Start the helper before the first click. Failures remain silent here and are
+// reported normally if the user actually presses the Warp button.
+try { connectWarpNative(); } catch {}
+
+function latestAssistantText(capture) {
+  return String(capture?.text || '').trim();
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Modal: pick which Warp pane receives the paste. Resolves to a paneId or null.
+function pickWarpPane(panes) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'warp-modal-overlay';
+    const modal = document.createElement('div');
+    modal.className = 'warp-modal';
+
+    const title = document.createElement('div');
+    title.className = 'warp-modal-title';
+    title.textContent = 'Send to which Warp pane?';
+
+    const list = document.createElement('div');
+    list.className = 'warp-modal-list';
+    const activeId = (panes.find(p => p.active) || panes[0])?.id;
+    for (const p of panes) {
+      const row = document.createElement('label');
+      row.className = 'warp-pane-row';
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'warp-pane';
+      radio.value = p.id;
+      if (p.id === activeId) radio.checked = true;
+      const text = document.createElement('span');
+      text.innerHTML = `<b>${escapeHtml(p.label)}</b><br><small>${escapeHtml(p.detail || p.app)}</small>`;
+      row.append(radio, text);
+      list.append(row);
+    }
+
+    const btns = document.createElement('div');
+    btns.className = 'warp-modal-btns';
+    const cancel = document.createElement('button');
+    cancel.type = 'button'; cancel.className = 'warp-btn-secondary'; cancel.textContent = 'Cancel';
+    const send = document.createElement('button');
+    send.type = 'button'; send.className = 'warp-btn-primary'; send.textContent = 'Paste only';
+    btns.append(cancel, send);
+
+    modal.append(title, list, btns);
+    overlay.append(modal);
+    document.body.append(overlay);
+
+    const close = val => { overlay.remove(); resolve(val); };
+    cancel.addEventListener('click', () => close(null));
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+    send.addEventListener('click', () => {
+      const chosen = modal.querySelector('input[name="warp-pane"]:checked');
+      close(chosen ? chosen.value : null);
+    });
+  });
+}
+
+async function sendPanelToWarp(frame, labelText, choosePane = false) {
+  if (warpTransferBusy) {
+    showStatus('A Warp transfer is already in progress…');
+    return;
+  }
+  warpTransferBusy = true;
+  showStatus(`Capturing ${labelText}…`);
+  try {
+    const capture = await captureFromFrame(frame);
+    const response = latestAssistantText(capture);
+    if (!response) {
+      showStatus(`Nothing to capture from ${labelText}`, 'error');
+      return;
+    }
+
+    let j;
+    if (!choosePane) {
+      // Fast path: one already-running native request, no pane screenshot or
+      // picker. Warp preserves keyboard focus in its last-used pane.
+      j = await sendWarpNativeMessage({
+        action: 'injectActive',
+        text: response,
+        submit: false
+      });
+    } else {
+      const paneResult = await sendWarpNativeMessage({ action: 'panes' });
+      const panes = paneResult?.panes || [];
+      if (!paneResult?.ok) {
+        showStatus(`Could not read Warp panes: ${paneResult?.error || 'unknown error'}`, 'error');
+        return;
+      }
+      if (!panes.length) {
+        showStatus('No Warp panes found — open Warp first', 'error');
+        return;
+      }
+      const paneId = await pickWarpPane(panes);
+      if (!paneId) {
+        showStatus('');
+        return;
+      }
+      j = await sendWarpNativeMessage({
+        action: 'inject',
+        text: response,
+        paneId,
+        focusPane: true,
+        submit: false
+      });
+    }
+
+    if (j.ok) showStatus(`Sent latest response → ${j.target || 'Warp'} ✓`, 'success');
+    else showStatus(`Warp inject failed: ${j.error || 'unknown'}`, 'error');
+  } catch (err) {
+    showStatus(`Warp inject failed: ${err.message || 'helper unreachable'}`, 'error');
+  } finally {
+    warpTransferBusy = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Grid / panel rendering
 // ---------------------------------------------------------------------------
-function gridColumns(n) {
-  return n <= 3 ? n : Math.ceil(n / 2);
+const PANEL_STATE_LABELS = {
+  idle: 'IDLE',
+  ready: 'READY',
+  preparing: 'PREPARING',
+  injecting: 'INJECTING',
+  uploading: 'UPLOADING',
+  verifying: 'VERIFYING',
+  verified: 'VERIFIED',
+  unverified: 'CHECK',
+  failed: 'ERROR',
+  not_ready: 'NOT READY'
+};
+
+function deliveryStateForLifecycle(state) {
+  if (['received', 'preparing'].includes(state)) return 'preparing';
+  if (['input_ready', 'injecting_text', 'text_ready'].includes(state)) return 'injecting';
+  if (['attaching', 'images_ready'].includes(state)) return 'uploading';
+  if (['action_ready', 'verifying', 'action_dispatched'].includes(state)) return 'verifying';
+  if (state === 'verified') return 'verified';
+  if (state === 'unverified') return 'unverified';
+  if (state === 'failed') return 'failed';
+  return null;
+}
+
+function setPanelDeliveryState(panelId, state, details = {}) {
+  const controller = panelControllers.get(panelId);
+  if (!controller) return;
+  if (Number.isInteger(details.panelEpoch) && details.panelEpoch !== controller.panelEpoch) return;
+
+  const next = PANEL_STATE_LABELS[state] ? state : 'idle';
+  controller.state = next;
+  controller.panel.dataset.deliveryState = next;
+  controller.liveState.textContent = PANEL_STATE_LABELS[next];
+  controller.liveState.title = details.reason || details.title || PANEL_STATE_LABELS[next];
+  controller.retryButton.hidden = !details.retry?.safe;
+  controller.retryButton.disabled = false;
+  controller.retryButton.title = details.retry?.safe
+    ? `Retry this panel: ${details.reason || 'delivery failed before submission'}`
+    : 'Retry is unavailable because the previous action may already have submitted';
+  if (details.result) controller.lastResult = details.result;
 }
 
 function buildPanel(id, key) {
   const provider = providerByKey(key);
+  const panelId = `${WORKSPACE_INSTANCE_ID}:${id}`;
   const panel = document.createElement('div');
   panel.className = 'panel';
   panel.dataset.id = String(id);
+  panel.dataset.panelId = panelId;
+  panel.dataset.provider = key;
+  panel.style.setProperty('--panel-accent', providerAccent(key));
 
   const head = document.createElement('div');
   head.className = 'panel-head';
+
+  const brand = document.createElement('div');
+  brand.className = 'panel-brand';
+  const logo = document.createElement('span');
+  logo.className = 'panel-logo';
+  logo.innerHTML = providerMark(key);
+  const liveDot = document.createElement('span');
+  liveDot.className = 'panel-live-dot';
 
   const select = document.createElement('select');
   select.className = 'panel-select';
@@ -149,29 +550,31 @@ function buildPanel(id, key) {
     select.appendChild(option);
   }
 
+  const liveState = document.createElement('span');
+  liveState.className = 'panel-live-state';
+  liveState.textContent = 'IDLE';
+  brand.append(logo, liveDot, select, liveState);
+
   const urlInput = document.createElement('input');
   urlInput.className = 'panel-url';
   urlInput.type = 'text';
   urlInput.spellcheck = false;
   urlInput.value = provider.url;
 
-  const goBtn = document.createElement('button');
-  goBtn.type = 'button';
-  goBtn.className = 'panel-btn';
-  goBtn.title = 'Go';
-  goBtn.textContent = '→';
-
-  const reloadBtn = document.createElement('button');
-  reloadBtn.type = 'button';
-  reloadBtn.className = 'panel-btn';
-  reloadBtn.title = 'Reload';
-  reloadBtn.textContent = '⟳';
-
-  const popBtn = document.createElement('button');
-  popBtn.type = 'button';
-  popBtn.className = 'panel-btn';
-  popBtn.title = 'Open in a real logged-in window (for sites that require login)';
-  popBtn.textContent = '⧉';
+  const goBtn = makePanelButton('panel-btn', 'Open URL',
+    '<svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
+  const reloadBtn = makePanelButton('panel-btn', 'Reload panel',
+    '<svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></svg>');
+  const maximizeBtn = makePanelButton('panel-btn panel-maximize', 'Maximize panel',
+    '<svg viewBox="0 0 24 24"><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 0 1-1v-4"/></svg>');
+  const warpBtn = makePanelButton('panel-btn panel-btn-warp', 'Send latest response to Warp (Shift+click to choose)',
+    '<span>WARP</span><svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
+  const retryBtn = makePanelButton('panel-btn panel-retry', 'Retry this panel',
+    '<svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></svg>');
+  retryBtn.hidden = true;
+  const panelActions = document.createElement('div');
+  panelActions.className = 'panel-actions';
+  panelActions.append(goBtn, reloadBtn, retryBtn, maximizeBtn, warpBtn);
 
   const frame = document.createElement('iframe');
   frame.className = 'panel-frame';
@@ -179,19 +582,74 @@ function buildPanel(id, key) {
   frame.setAttribute('allow', 'clipboard-write; clipboard-read; microphone; camera; autoplay');
 
   // — per-panel state —
-  let windowed = false;          // true → running in a real popped-out window
-  let placeholder = null;        // the "open window" card element
-  let loadingEl = null;          // the "Loading…" veil over the frame
-  let aliveResolved = false;     // panel-alive seen → embed succeeded
-  let watchTimer = null;         // embed-failure fallback timer
-  function currentUrl() { return normalizeUrl(urlInput.value) || provider.url; }
+  let loadingEl = null;
+  let aliveResolved = false;
+  let watchTimer = null;
+  let panelEpoch = 1;
+  const bindingTimers = new Set();
+  const controller = {
+    id,
+    panelId,
+    panelEpoch,
+    providerKey: key,
+    panel,
+    frame,
+    liveState,
+    retryButton: retryBtn,
+    state: 'idle',
+    lastResult: null
+  };
+  panelControllers.set(panelId, controller);
   const label = () => providerByKey(selectedKeys[id])?.label || 'AI';
 
-  // — embed detection — show a loading veil over the frame; reveal it when
-  //   content.js inside the panel posts 'panel-alive'. If the site never loads
-  //   embedded within the timeout (XFO/CSP block, anti-embed), automatically
-  //   fall back to a real logged-in window. This means EVERY site attempts to
-  //   embed first, and only the ones that truly can't get the window card.
+  function clearBindingTimers() {
+    for (const timer of bindingTimers) clearTimeout(timer);
+    bindingTimers.clear();
+  }
+
+  function postPanelBinding() {
+    try {
+      frame.contentWindow?.postMessage({
+        __aib: 'panel-binding',
+        protocolVersion: DELIVERY.VERSION,
+        panelId,
+        panelEpoch,
+        providerKey: selectedKeys[id]
+      }, '*');
+    } catch {}
+  }
+
+  function schedulePanelBinding() {
+    clearBindingTimers();
+    postPanelBinding();
+    for (const delay of [100, 500, 1500]) {
+      const timer = setTimeout(() => {
+        bindingTimers.delete(timer);
+        postPanelBinding();
+      }, delay);
+      bindingTimers.add(timer);
+    }
+  }
+
+  function navigateFrame(url) {
+    panelEpoch += 1;
+    controller.panelEpoch = panelEpoch;
+    controller.providerKey = selectedKeys[id];
+    controller.lastResult = null;
+    setPanelDeliveryState(panelId, 'preparing');
+    frame.src = url;
+    startEmbedWatch();
+  }
+  controller.navigate = navigateFrame;
+
+  function updatePanelIdentity(nextProvider) {
+    panel.dataset.provider = nextProvider.key;
+    panel.style.setProperty('--panel-accent', providerAccent(nextProvider.key));
+    logo.innerHTML = providerMark(nextProvider.key);
+  }
+
+  // Keep the provider mounted while its content script registers. A late
+  // registration changes the state to uncertain without destroying the frame.
   function showLoading() {
     removeLoading();
     loadingEl = document.createElement('div');
@@ -202,97 +660,69 @@ function buildPanel(id, key) {
   function removeLoading() { loadingEl?.remove(); loadingEl = null; }
 
   function startEmbedWatch() {
-    if (windowed) return;
     aliveResolved = false;
     clearTimeout(watchTimer);
     showLoading();
     watchTimer = setTimeout(() => {
-      if (aliveResolved || windowed) return;
+      if (aliveResolved) return;
       removeLoading();
-      goWindowed({ openNow: false, blocked: true });   // site refused to embed
+      // Never unload a provider just because its readiness ping was late. The
+      // frame stays mounted and can finish loading independently in every
+      // workspace. This also avoids turning a temporary delay into a blank slot.
+      setPanelDeliveryState(panelId, 'not_ready', { reason: 'Panel content script did not register in time' });
     }, EMBED_TIMEOUT_MS);
   }
-  function notifyAlive(host) {
-    if (aliveResolved || windowed) return;
+  function notifyAlive(message) {
+    const host = message?.host || '';
+    if (message?.panelId && message.panelId !== panelId) return;
+    if (Number.isInteger(message?.panelEpoch) && message.panelEpoch !== panelEpoch) return;
     if (!hostMatch(host, hostOf(frame.src))) return;
     aliveResolved = true;
+    controller.frameId = Number.isInteger(message?.frameId) ? message.frameId : controller.frameId;
     clearTimeout(watchTimer);
     removeLoading();
+    if (!activeDelivery?.inFlight) setPanelDeliveryState(panelId, 'ready');
   }
-  panelMonitors.push({ notifyAlive });
-
-  // — pop-out card —
-  function showPlaceholder(blocked) {
-    placeholder?.remove();
-    placeholder = document.createElement('div');
-    placeholder.className = 'panel-windowed';
-    placeholder.innerHTML =
-      `<div class="pw-icon">⧉</div>` +
-      `<div class="pw-title">${label()}</div>` +
-      `<div class="pw-sub">${blocked
-        ? "This site won't load embedded (login / anti-embed).<br>Open it as a real logged-in window — broadcasts still reach it."
-        : 'Running in a separate logged-in window.<br>Broadcasts still reach it.'}</div>`;
-    const open = document.createElement('button');
-    open.type = 'button'; open.className = 'pw-btn'; open.textContent = 'Open logged-in window ↗';
-    open.addEventListener('click', () => {
-      showStatus(`Opening ${label()} in a logged-in window…`);
-      chrome.runtime.sendMessage({ action: 'openPanelWindow', id, url: currentUrl() }).catch(() => {});
-      setTimeout(() => showStatus(''), 1400);
-    });
-    const back = document.createElement('button');
-    back.type = 'button'; back.className = 'pw-btn ghost';
-    back.textContent = blocked ? 'Try embedding again' : 'Bring back into panel';
-    back.addEventListener('click', () => goFramed());
-    placeholder.append(open, back);
-    panel.append(placeholder);
-  }
-
-  async function goWindowed({ openNow, blocked = false }) {
-    windowed = true;
-    aliveResolved = true;
-    clearTimeout(watchTimer);
-    removeLoading();
-    popBtn.classList.add('active');
-    frame.style.display = 'none';
-    frame.src = 'about:blank';            // unload the partitioned/blocked frame
-    showPlaceholder(blocked);
-    if (openNow) {
-      showStatus(`Opening ${label()} in a logged-in window…`);
-      await chrome.runtime.sendMessage({ action: 'openPanelWindow', id, url: currentUrl() }).catch(() => {});
-      showStatus('');
+  panelMonitors.push({
+    notifyAlive,
+    dispose() {
+      clearTimeout(watchTimer);
+      clearBindingTimers();
+      watchTimer = null;
     }
-  }
+  });
 
-  async function goFramed() {
-    windowed = false;
-    popBtn.classList.remove('active');
-    await chrome.runtime.sendMessage({ action: 'closePanelWindow', id }).catch(() => {});
-    placeholder?.remove();
-    placeholder = null;
-    frame.style.display = '';
-    const url = currentUrl();
-    await prepareOrigins([`https://${hostOf(url)}`, ...originsForKey(selectedKeys[id])]);
-    frame.src = url;
-    startEmbedWatch();
-  }
+  // A cross-origin iframe emits load on its owning element. Bind its new document
+  // to this stable panel identity, then wait for content-script readiness.
+  frame.addEventListener('load', () => {
+    removeLoading();
+    schedulePanelBinding();
+  });
 
   // — wiring —
   select.addEventListener('change', async () => {
+    if (activeDelivery?.inFlight) {
+      select.value = selectedKeys[id];
+      showStatus('Wait for the active delivery before changing a provider.', 'error');
+      return;
+    }
+    activeDelivery = null;
     selectedKeys[id] = select.value;
     const p2 = providerByKey(select.value);
+    updatePanelIdentity(p2);
     urlInput.value = p2.url;
     showStatus(`Loading ${p2.label}…`);
-    if (windowed) {
-      await goFramed();          // re-embed the newly chosen site
-    } else {
-      await prepareOrigins(originsForKey(select.value));
-      frame.src = p2.url;
-      startEmbedWatch();
-    }
+    await prepareFrames(originsForKey(select.value));
+    navigateFrame(p2.url);
     showStatus(`Panel ${id + 1} → ${p2.label}.`, 'success');
   });
 
   const navigate = async () => {
+    if (activeDelivery?.inFlight) {
+      showStatus('Wait for the active delivery before navigating a panel.', 'error');
+      return;
+    }
+    activeDelivery = null;
     const url = normalizeUrl(urlInput.value);
     if (!url) return;
     urlInput.value = url;
@@ -301,13 +731,8 @@ function buildPanel(id, key) {
       selectedKeys[id] = matchedKey;
       select.value = matchedKey;
     }
-    if (windowed) {  // retarget the popped-out window
-      chrome.runtime.sendMessage({ action: 'openPanelWindow', id, url }).catch(() => {});
-      return;
-    }
-    await prepareOrigins([`https://${hostOf(url)}`, ...originsForKey(selectedKeys[id])]);
-    frame.src = url;
-    startEmbedWatch();
+    await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(selectedKeys[id])]);
+    navigateFrame(url);
   };
   goBtn.addEventListener('click', navigate);
   urlInput.addEventListener('keydown', e => {
@@ -315,36 +740,70 @@ function buildPanel(id, key) {
   });
 
   reloadBtn.addEventListener('click', async () => {
-    if (windowed) {  // when popped out, reload re-focuses the real window
-      chrome.runtime.sendMessage({ action: 'openPanelWindow', id, url: currentUrl() }).catch(() => {});
+    if (activeDelivery?.inFlight) {
+      showStatus('Wait for the active delivery before reloading a panel.', 'error');
       return;
     }
+    activeDelivery = null;
     showStatus(`Reloading panel ${id + 1}…`);
-    await prepareOrigins([`https://${hostOf(frame.src)}`, ...originsForKey(selectedKeys[id])]);
-    frame.src = frame.src; // eslint-disable-line no-self-assign
-    startEmbedWatch();
+    await prepareFrames([`https://${hostOf(frame.src)}`, ...originsForKey(selectedKeys[id])]);
+    navigateFrame(frame.src);
     showStatus('');
   });
 
-  popBtn.addEventListener('click', () => {
-    if (windowed) goFramed();
-    else goWindowed({ openNow: true });
+  retryBtn.addEventListener('click', () => retryPanel(panelId));
+
+  warpBtn.addEventListener('click', event => {
+    sendPanelToWarp(frame, label(), event.shiftKey);
   });
 
-  head.append(select, urlInput, goBtn, reloadBtn, popBtn);
+  maximizeBtn.addEventListener('click', () => {
+    const maximizing = !panel.classList.contains('is-maximized');
+    for (const other of el.grid.querySelectorAll('.panel')) other.classList.remove('is-maximized');
+    panel.classList.toggle('is-maximized', maximizing);
+    el.gridShell.classList.toggle('has-maximized-panel', maximizing);
+    maximizeBtn.classList.toggle('active', maximizing);
+    maximizeBtn.title = maximizing ? 'Restore panel' : 'Maximize panel';
+  });
+
+  panel.addEventListener('pointerenter', () => {
+    if (focusModeEnabled) setFocusedPanel(id);
+  });
+  head.addEventListener('pointerdown', () => setFocusedPanel(id));
+
+  head.append(brand, urlInput, panelActions);
   panel.append(head, frame);
 
-  startEmbedWatch();   // watch the initial embed; fall back to a window if blocked
+  setPanelDeliveryState(panelId, 'preparing');
+  startEmbedWatch();
   return panel;
 }
 
 function renderGrid() {
-  el.grid.style.gridTemplateColumns = `repeat(${gridColumns(count)}, 1fr)`;
+  // Retired frames must not retain embed timers. Otherwise a provider switch
+  // can let the old panel's timeout fire after the new panel is already live.
+  for (const monitor of panelMonitors) monitor.dispose?.();
+  panelMonitors = [];
+  panelControllers.clear();
+
+  const isQuad = count === 4;
+  el.gridShell.classList.toggle('is-resizable', isQuad);
+  el.grid.className = `grid grid-${count}`;
+  if (isQuad) {
+    el.grid.style.gridTemplateColumns = 'minmax(0, calc(var(--split-x) - 3px)) minmax(0, calc(100% - var(--split-x) - 3px))';
+    el.grid.style.gridTemplateRows = 'minmax(0, calc(var(--split-y) - 3px)) minmax(0, calc(100% - var(--split-y) - 3px))';
+  } else {
+    el.grid.style.removeProperty('grid-template-columns');
+    el.grid.style.removeProperty('grid-template-rows');
+  }
   el.grid.innerHTML = '';
-  panelMonitors = [];   // drop monitors from the previous render
+  el.gridShell.classList.remove('has-maximized-panel');
   selectedKeys.slice(0, count).forEach((key, id) => {
     el.grid.appendChild(buildPanel(id, key));
   });
+  el.panelReadout.textContent = `${String(count).padStart(2, '0')} PANELS`;
+  applyGridSplit();
+  renderFocusMode();
 }
 
 function renderCountButtons() {
@@ -365,116 +824,432 @@ function setCount(next) {
 }
 
 // ---------------------------------------------------------------------------
-// Auth-gateway messages from background (login can't finish inside an iframe).
-// background pops a real first-party login tab, asks us to reset the panel to
-// the AI home (abort broken in-frame auth), then reload it once authed.
+// background.js resets a direct panel when it attempts an external auth flow
+// that cannot complete reliably inside an embedded third-party context.
 // ---------------------------------------------------------------------------
-function framesByHost(host) {
-  return [...el.grid.querySelectorAll('iframe.panel-frame')]
-    .filter(frame => hostOf(frame.src) === host
-      || hostOf(frame.src).split('.').slice(-2).join('.') === String(host).split('.').slice(-2).join('.'));
-}
-
 function resetPanelsByHost(host, url) {
-  for (const frame of framesByHost(host)) frame.src = url || frame.src;
+  for (const controller of panelControllers.values()) {
+    if (!hostMatch(hostOf(controller.frame.src), host)) continue;
+    controller.navigate?.(url || controller.frame.src);
+  }
 }
 
-function reloadPanelsByHost(host, url) {
-  for (const frame of framesByHost(host)) frame.src = url || frame.src;
-}
-
-chrome.runtime.onMessage.addListener(msg => {
-  if (!msg || !msg.action) return;
-  if (msg.action === 'authResetPanel')  resetPanelsByHost(msg.host, msg.url);
-  if (msg.action === 'authReloadPanel') reloadPanelsByHost(msg.host, msg.url);
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || !msg.action) return false;
+  if (msg.action === 'panelAlive') {
+    for (const monitor of panelMonitors) monitor.notifyAlive(msg);
+    return false;
+  }
+  if (msg.action === 'deliveryLifecycle') {
+    if (!activeDelivery || msg.deliveryId !== activeDelivery.deliveryId) return false;
+    const state = deliveryStateForLifecycle(msg.state);
+    if (state && msg.panelId) {
+      setPanelDeliveryState(msg.panelId, state, {
+        panelEpoch: Number(msg.panelEpoch),
+        reason: msg.details?.reason || msg.state
+      });
+    }
+    return false;
+  }
+  if (msg.action === 'authResetPanel') {
+    resetPanelsByHost(msg.host, msg.url);
+    return false;
+  }
+  if (msg.action === 'compose-add') {
+    const added = addToComposer(msg.text, msg.images, msg.broadcast);
+    sendResponse({ added });
+    return true;
+  }
+  return false;
 });
 
+// Fill the composer from the grab hotkey (background handleGrabCommand).
+// broadcast=false → just fill the box; broadcast=true → fill AND send now.
+function addToComposer(text, images, broadcast = false) {
+  let added = false;
+
+  const trimmed = (text || '').trim();
+  if (trimmed) {
+    el.prompt.value = el.prompt.value
+      ? `${el.prompt.value.replace(/\s+$/, '')}\n\n${trimmed}`
+      : trimmed;
+    el.prompt.style.height = 'auto';
+    el.prompt.style.height = `${Math.min(el.prompt.scrollHeight, 120)}px`;
+    added = true;
+  }
+
+  const incomingAttachments = (images || [])
+    .filter(image => image?.base64)
+    .map(image => ({
+      id: nextImageId++,
+      base64: image.base64,
+      name: image.name || (image.type === 'application/pdf' ? 'document.pdf' : 'grab.png'),
+      type: image.type || 'image/png',
+      size: Number(image.size) || DELIVERY.estimatedDataUrlBytes(image.base64)
+    }));
+  if (incomingAttachments.length) {
+    const validation = DELIVERY.validateAttachments([...attachedImages, ...incomingAttachments]);
+    if (!validation.ok) {
+      showStatus(attachmentErrorMessage(validation.reason), 'error');
+    } else {
+      attachedImages.push(...incomingAttachments);
+      renderImages();
+      added = true;
+    }
+  }
+
+  if (!added) return false;
+  markDraftChanged();
+
+  if (broadcast) {
+    showStatus('Broadcasting pasted content…');
+    el.composer.requestSubmit();   // runs the normal submit → broadcast + clear
+  } else {
+    el.prompt.focus();
+    showStatus('Pasted — press SEND to broadcast.', 'success');
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
-// Images
+// Attachments
 // ---------------------------------------------------------------------------
-function readImageFile(file) {
+function attachmentErrorMessage(reason) {
+  return {
+    too_many_attachments: `Attach no more than ${ATTACHMENT_LIMITS.maxCount} files.`,
+    attachment_too_large: 'Each attachment must be 20 MB or smaller.',
+    attachment_batch_too_large: 'The combined attachment payload must be 48 MB or smaller.',
+    unsupported_attachment_type: 'Only images and PDF files are supported.',
+    invalid_attachment_data: 'One attachment could not be read safely.'
+  }[reason] || 'Could not attach that file.';
+}
+
+function readAttachmentFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = e => resolve({ id: nextImageId++, base64: e.target.result, name: file.name || 'image.png', type: file.type || 'image/png' });
+    reader.onload = event => resolve({
+      id: nextImageId++,
+      base64: event.target.result,
+      name: file.name || (file.type === 'application/pdf' ? 'document.pdf' : 'image.png'),
+      type: file.type || 'application/octet-stream',
+      size: file.size || 0
+    });
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
 }
 
-function imageFilesFromList(files) {
-  return Array.from(files || []).filter(f => f?.type?.startsWith('image/'));
+function attachmentFilesFromList(files) {
+  return Array.from(files || []).filter(file =>
+    file?.type === 'application/pdf' || file?.type?.startsWith('image/'));
 }
 
 function renderImages() {
   el.imageStrip.innerHTML = '';
   for (const image of attachedImages) {
     const tile = document.createElement('div');
-    tile.className = 'image-tile';
-    const img = document.createElement('img');
-    img.src = image.base64; img.alt = image.name;
+    tile.className = `image-tile${image.type === 'application/pdf' ? ' is-pdf' : ''}`;
+    if (image.type === 'application/pdf') {
+      const badge = document.createElement('span');
+      badge.className = 'file-badge';
+      badge.textContent = 'PDF';
+      badge.title = image.name;
+      tile.append(badge);
+    } else {
+      const img = document.createElement('img');
+      img.src = image.base64;
+      img.alt = image.name;
+      tile.append(img);
+    }
     const remove = document.createElement('button');
     remove.className = 'remove-btn'; remove.type = 'button';
     remove.textContent = '×'; remove.dataset.imageId = String(image.id);
-    tile.append(img, remove);
+    remove.title = `Remove ${image.name}`;
+    tile.append(remove);
     el.imageStrip.append(tile);
   }
 }
 
 async function loadImageFiles(files) {
-  const imageFiles = imageFilesFromList(files);
-  if (!imageFiles.length) return;
-  const images = await Promise.all(imageFiles.map(readImageFile));
-  attachedImages.push(...images);
+  const candidates = attachmentFilesFromList(files);
+  if (!candidates.length) {
+    if (Array.from(files || []).length) showStatus('Only images and PDF files are supported.', 'error');
+    return;
+  }
+
+  if (attachedImages.length + candidates.length > ATTACHMENT_LIMITS.maxCount) {
+    showStatus(attachmentErrorMessage('too_many_attachments'), 'error');
+    return;
+  }
+  if (candidates.some(file => file.size > ATTACHMENT_LIMITS.maxFileBytes)) {
+    showStatus(attachmentErrorMessage('attachment_too_large'), 'error');
+    return;
+  }
+  const currentBytes = attachedImages.reduce((total, file) =>
+    total + (file.size || DELIVERY.estimatedDataUrlBytes(file.base64)), 0);
+  const incomingBytes = candidates.reduce((total, file) => total + (file.size || 0), 0);
+  if (currentBytes + incomingBytes > ATTACHMENT_LIMITS.maxTotalBytes) {
+    showStatus(attachmentErrorMessage('attachment_batch_too_large'), 'error');
+    return;
+  }
+
+  const attachments = await Promise.all(candidates.map(readAttachmentFile));
+  const validation = DELIVERY.validateAttachments([...attachedImages, ...attachments]);
+  if (!validation.ok) {
+    showStatus(attachmentErrorMessage(validation.reason), 'error');
+    return;
+  }
+  attachedImages.push(...attachments);
+  markDraftChanged();
   el.imageInput.value = '';
   renderImages();
 }
 
 function broadcastImages() {
-  return attachedImages.map(({ base64, name, type }) => ({ base64, name, type }));
+  return attachedImages.map(({ base64, name, type, size }) => ({ base64, name, type, size }));
 }
 
-function clearImages() {
-  attachedImages = [];
-  el.imageInput.value = '';
+// ---------------------------------------------------------------------------
+// Verified delivery
+// ---------------------------------------------------------------------------
+function panelAttempt(delivery, controller) {
+  const attemptNumber = (delivery.attemptNumbers.get(controller.panelId) || 0) + 1;
+  delivery.attemptNumbers.set(controller.panelId, attemptNumber);
+  return {
+    panelId: controller.panelId,
+    panelEpoch: controller.panelEpoch,
+    providerKey: controller.providerKey,
+    hostname: hostOf(controller.frame.src),
+    attemptId: `${delivery.deliveryId}:${controller.panelId}:${attemptNumber}`,
+    isRetry: attemptNumber > 1
+  };
+}
+
+function deliveryResults(delivery) {
+  return delivery.expectedPanelIds
+    .map(panelId => delivery.results.get(panelId))
+    .filter(Boolean);
+}
+
+function deliveryIsFullyVerified(delivery) {
+  return delivery.expectedPanelIds.length > 0
+    && delivery.expectedPanelIds.every(panelId =>
+      delivery.results.get(panelId)?.attempt?.outcome === 'verified');
+}
+
+function showDeliverySummary(delivery) {
+  const results = deliveryResults(delivery);
+  const expected = delivery.expectedPanelIds.map(panelId => ({ panelId }));
+  const summary = DELIVERY.summarizeDelivery(results, expected);
+  delivery.summary = summary;
+
+  if (summary.outcome === 'verified') {
+    showStatus(`Verified by all ${summary.verified} panels.`, 'success');
+  } else if (summary.outcome === 'partial') {
+    showStatus(
+      `${summary.verified}/${summary.expected} verified. Failed panels remain retryable when safe.`,
+      'error'
+    );
+  } else if (summary.outcome === 'unverified') {
+    showStatus('Submission was dispatched, but provider acceptance could not be proven. Check the marked panels.', 'error');
+  } else if (summary.outcome === 'no_targets') {
+    showStatus('No ready panel frames were registered. Your draft was preserved.', 'error');
+  } else {
+    showStatus('Delivery failed before verification. Your draft was preserved.', 'error');
+  }
+  return summary;
+}
+
+function applyPanelResults(delivery, results) {
+  for (const result of results || []) {
+    if (!result?.panelId || !delivery.expectedPanelIds.includes(result.panelId)) continue;
+    delivery.results.set(result.panelId, result);
+    const outcome = result.attempt?.outcome || result.outcome || 'failed';
+    setPanelDeliveryState(result.panelId, outcome, {
+      panelEpoch: Number(result.panelEpoch),
+      reason: result.attempt?.reason || result.reason,
+      retry: result.attempt?.retry || result.retry,
+      result
+    });
+  }
+}
+
+function clearDeliveredDraft(delivery) {
+  if (draftRevision !== delivery.draftRevision) return false;
+  if (el.prompt.value !== delivery.promptSnapshot) return false;
+
+  el.prompt.value = '';
+  el.prompt.style.height = 'auto';
+  const deliveredImageIds = new Set(delivery.imageIds);
+  attachedImages = attachedImages.filter(image => !deliveredImageIds.has(image.id));
   renderImages();
+  markDraftChanged();
+  return true;
 }
 
-// ---------------------------------------------------------------------------
-// Broadcast — background.broadcast() finds every registered panel frame in this
-// (the workspace) tab and injects the prompt into each at once.
-// ---------------------------------------------------------------------------
-async function broadcast(text, images) {
-  const response = await chrome.runtime.sendMessage({
+async function dispatchDelivery(delivery, controllers) {
+  const panelAttempts = controllers.map(controller => panelAttempt(delivery, controller));
+  for (const controller of controllers) {
+    setPanelDeliveryState(controller.panelId, 'preparing', { panelEpoch: controller.panelEpoch });
+  }
+
+  delivery.inFlight = true;
+  const response = await sendWorkspaceMessage({
     action: 'execute',
+    deliveryId: delivery.deliveryId,
+    panelAttempts,
+    text: delivery.text,
+    images: delivery.images,
+    imageBase64: delivery.images[0]?.base64 || null,
+    imageName: delivery.images[0]?.name || null,
+    imageType: delivery.images[0]?.type || null
+  });
+  delivery.inFlight = false;
+
+  applyPanelResults(delivery, response?.panelResults || response?.results || []);
+  showDeliverySummary(delivery);
+  if (deliveryIsFullyVerified(delivery)) {
+    clearDeliveredDraft(delivery);
+    if (activeDelivery === delivery) activeDelivery = null;
+  }
+  return response;
+}
+
+async function retryPanel(panelId) {
+  const delivery = activeDelivery;
+  const controller = panelControllers.get(panelId);
+  const prior = delivery?.results.get(panelId);
+  const retry = prior?.attempt?.retry || prior?.retry;
+  if (!delivery || !controller || !retry?.safe || delivery.inFlight) return;
+
+  controller.retryButton.disabled = true;
+  try {
+    await dispatchDelivery(delivery, [controller]);
+  } catch (error) {
+    setPanelDeliveryState(panelId, 'failed', {
+      reason: error?.message || 'retry_failed',
+      retry: { safe: false }
+    });
+    showStatus(`Retry failed: ${error?.message || 'unknown error'}`, 'error');
+  } finally {
+    controller.retryButton.disabled = false;
+  }
+}
+
+function createDelivery(text, images, promptSnapshot, imageIds) {
+  const controllers = [...panelControllers.values()];
+  const delivery = {
+    deliveryId: createId('delivery'),
     text,
     images,
-    imageBase64: images[0]?.base64 || null,
-    imageName:   images[0]?.name   || null,
-    imageType:   images[0]?.type   || null
-  });
-
-  const sent  = response?.count  ?? 0;
-  const total = response?.frames ?? count;
-  if (sent >= total && total > 0) {
-    showStatus(`Sent to all ${sent} panels.`, 'success');
-  } else if (sent > 0) {
-    showStatus(`Sent to ${sent}/${total}. Some may need login.`, 'error');
-  } else {
-    showStatus('Reached panels — check the windows (some may need login).', '');
-  }
+    promptSnapshot,
+    imageIds,
+    draftRevision,
+    expectedPanelIds: controllers.map(controller => controller.panelId),
+    attemptNumbers: new Map(),
+    results: new Map(),
+    inFlight: false,
+    summary: null
+  };
+  return { delivery, controllers };
 }
 
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
+el.focusMode.addEventListener('click', () => {
+  focusModeEnabled = !focusModeEnabled;
+  renderFocusMode();
+});
+
+function snapSplit(value) {
+  const clamped = Math.min(0.72, Math.max(0.28, value));
+  for (const point of [1 / 3, 0.5, 2 / 3]) {
+    if (Math.abs(clamped - point) <= 0.035) return point;
+  }
+  return clamped;
+}
+
+function startSplitDrag(axis, event) {
+  if (count !== 4 || event.button !== 0) return;
+  event.preventDefault();
+  const handle = axis === 'x' ? el.splitX : axis === 'y' ? el.splitY : el.splitNode;
+  handle.setPointerCapture?.(event.pointerId);
+  document.documentElement.classList.add('is-resizing');
+
+  const move = moveEvent => {
+    const rect = el.gridShell.getBoundingClientRect();
+    if (axis !== 'y') splitX = Math.min(0.72, Math.max(0.28, (moveEvent.clientX - rect.left) / rect.width));
+    if (axis !== 'x') splitY = Math.min(0.72, Math.max(0.28, (moveEvent.clientY - rect.top) / rect.height));
+    applyGridSplit();
+  };
+  const end = endEvent => {
+    handle.releasePointerCapture?.(endEvent.pointerId);
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', end);
+    handle.removeEventListener('pointercancel', end);
+    document.documentElement.classList.remove('is-resizing');
+    if (axis !== 'y') splitX = snapSplit(splitX);
+    if (axis !== 'x') splitY = snapSplit(splitY);
+    flushGridSplit();
+    saveWorkspaceLayout().catch(() => {});
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
+}
+
+el.splitX.addEventListener('pointerdown', event => startSplitDrag('x', event));
+el.splitY.addEventListener('pointerdown', event => startSplitDrag('y', event));
+el.splitNode.addEventListener('pointerdown', event => startSplitDrag('both', event));
+el.splitNode.addEventListener('dblclick', () => {
+  splitX = 0.5;
+  splitY = 0.5;
+  flushGridSplit();
+  saveWorkspaceLayout().catch(() => {});
+});
+
+let titleSaveTimer = null;
+el.title.addEventListener('input', () => {
+  applyWorkspaceTitle(el.title.value, false);
+  clearTimeout(titleSaveTimer);
+  titleSaveTimer = setTimeout(() => saveWorkspaceTitle().catch(() => {}), 300);
+});
+el.title.addEventListener('change', () => saveWorkspaceTitle().catch(() => {}));
+el.title.addEventListener('keydown', event => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    saveWorkspaceTitle().catch(() => {});
+    el.title.blur();
+  }
+});
+
+el.newWorkspace.addEventListener('click', async () => {
+  el.newWorkspace.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'openWorkspace', count });
+    if (!response?.ok) throw new Error(response?.reason || 'Could not open workspace');
+    showStatus('Opened another independent workspace.', 'success');
+  } catch (err) {
+    showStatus(`Could not open workspace: ${err?.message || 'unknown error'}`, 'error');
+  } finally {
+    el.newWorkspace.disabled = false;
+  }
+});
+
 el.panelCount.addEventListener('click', async event => {
   const btn = event.target.closest('button[data-count]');
   if (!btn) return;
   const next = Number(btn.dataset.count);
   if (next === count) return;
+  if (activeDelivery?.inFlight) {
+    showStatus('Wait for the active delivery to finish before changing the grid.', 'error');
+    return;
+  }
+  activeDelivery = null;
   setCount(next);
   showStatus('Preparing panels…');
-  await prepareOrigins(selectedKeys.slice(0, count).flatMap(originsForKey));
+  await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey));
   showStatus('');
   renderGrid();
 });
@@ -487,7 +1262,7 @@ el.fsBtn.addEventListener('click', () => {
 el.attachBtn.addEventListener('click', () => el.imageInput.click());
 
 el.imageInput.addEventListener('change', e => {
-  loadImageFiles(e.target.files).catch(() => showStatus('Could not load image.', 'error'));
+  loadImageFiles(e.target.files).catch(() => showStatus('Could not load attachment.', 'error'));
 });
 
 document.addEventListener('paste', e => {
@@ -498,10 +1273,12 @@ el.imageStrip.addEventListener('click', event => {
   const btn = event.target.closest('button[data-image-id]');
   if (!btn) return;
   attachedImages = attachedImages.filter(img => img.id !== Number(btn.dataset.imageId));
+  markDraftChanged();
   renderImages();
 });
 
 el.prompt.addEventListener('input', () => {
+  markDraftChanged();
   el.prompt.style.height = 'auto';
   el.prompt.style.height = `${Math.min(el.prompt.scrollHeight, 120)}px`;
 });
@@ -514,25 +1291,35 @@ el.prompt.addEventListener('keydown', event => {
 
 el.composer.addEventListener('submit', async event => {
   event.preventDefault();
-  const text = el.prompt.value.trim();
-  const images = broadcastImages();
-  if (!text && !images.length) {
-    showStatus('Enter a prompt or attach an image first.', 'error');
+  if (el.sendBtn.disabled) return;
+  if (activeDelivery && activeDelivery.draftRevision === draftRevision) {
+    showStatus('This preserved draft already has unresolved panels. Use a safe panel retry or edit the draft to start a new delivery.', 'error');
     return;
   }
 
+  const promptSnapshot = el.prompt.value;
+  const text = promptSnapshot.trim();
+  const imageIds = attachedImages.map(image => image.id);
+  const images = broadcastImages();
+  if (!text && !images.length) {
+    showStatus('Enter a prompt or attach a file first.', 'error');
+    return;
+  }
+
+  const { delivery, controllers } = createDelivery(text, images, promptSnapshot, imageIds);
+  activeDelivery = delivery;
   el.sendBtn.disabled = true;
-  showStatus('Broadcasting…');
-  el.prompt.value = '';
-  el.prompt.style.height = 'auto';
-  clearImages();
+  el.composer.classList.add('is-broadcasting');
+  showStatus('Preparing verified delivery…');
 
   try {
-    await broadcast(text, images);
-  } catch (err) {
-    showStatus(err?.message ? `Error: ${err.message}` : 'Broadcast failed.', 'error');
+    await dispatchDelivery(delivery, controllers);
+  } catch (error) {
+    delivery.inFlight = false;
+    showStatus(error?.message ? `Error: ${error.message}` : 'Broadcast failed. Your draft was preserved.', 'error');
   } finally {
     el.sendBtn.disabled = false;
+    el.composer.classList.remove('is-broadcasting');
     el.prompt.focus();
   }
 });
@@ -541,6 +1328,11 @@ el.composer.addEventListener('submit', async event => {
 // Init — seed panels from the popup's selection, else defaults.
 // ---------------------------------------------------------------------------
 async function init() {
+  const claim = await chrome.runtime.sendMessage({ action: 'claimWorkspace' }).catch(() => null);
+  workspaceTabId = Number.isInteger(claim?.tabId) ? claim.tabId : null;
+  await loadWorkspaceTitle();
+  await loadWorkspaceLayout();
+
   let seed = null;
   try {
     const stored = await chrome.storage.local.get('aib_workspace_seed');
@@ -552,6 +1344,9 @@ async function init() {
     selectedKeys = seed.panels.map(p => keyFromUrl(typeof p === 'string' ? p : p?.url)).filter(Boolean);
   }
 
+  const requestedCount = Number(WORKSPACE_PARAMS.get('count'));
+  if (PANEL_COUNTS.includes(requestedCount)) count = requestedCount;
+
   if (selectedKeys.length < count) {
     const seedKeys = DEFAULT_PANEL_URLS.map(keyFromUrl).filter(Boolean);
     const filler = seedKeys.length >= count ? seedKeys : randomKeys(count);
@@ -559,13 +1354,9 @@ async function init() {
   }
   selectedKeys = selectedKeys.slice(0, count);
 
-  // Arm DNR rules AND purge cache/SW for the selected origins BEFORE any iframe
-  // loads — otherwise an authed site whose service worker serves the cached
-  // document (Venice) loads with its un-stripped frame-ancestors CSP and the
-  // frame is blocked. Forcing a fresh network fetch lets DNR strip the CSP.
-  const initOrigins = selectedKeys.slice(0, count).flatMap(originsForKey);
+  // Arm frame rules and clear selected-provider caches before iframe navigation.
   showStatus('Preparing panels…');
-  await prepareOrigins(initOrigins);
+  await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey));
   showStatus('');
 
   renderCountButtons();
