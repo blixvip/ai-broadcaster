@@ -14,6 +14,7 @@ AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat si
 - [Project Structure](#project-structure)
 - [Architecture](#architecture)
 - [Testing](#testing)
+- [Automated Maintenance (Sandcastle)](#automated-maintenance-sandcastle)
 - [Optional: Screenshot Hotkey (Windows)](#optional-screenshot-hotkey-windows)
 - [Privacy](#privacy)
 - [Known Limitations](#known-limitations)
@@ -49,7 +50,7 @@ There is no packaged/store release. Load it as an unpacked extension:
 4. Click **Load unpacked** and select the repository folder.
 5. Pin the AI Broadcaster icon from the extensions toolbar menu.
 
-**Prerequisites:** a Chromium-based browser (Manifest V3 support). No build step, no `package.json`, no external dependencies to install.
+**Prerequisites:** a Chromium-based browser (Manifest V3 support). The extension itself has no build step or runtime dependencies. Optional developer automation uses the dev-only packages in `package.json`.
 
 ## Usage
 
@@ -109,9 +110,12 @@ See [`PROVIDER_AUTOMATION.md`](PROVIDER_AUTOMATION.md) for the full, authoritati
 
 ## Testing
 
-Tests use Node's built-in test runner (`node:test`) — no test framework dependency, no `package.json` script:
+Tests use Node's built-in test runner (`node:test`) with no test framework dependency:
 
 ```bash
+npm test
+
+# Or run an individual verifier:
 node tests/delivery-protocol.test.mjs
 node tests/telemetry.test.mjs
 node tests/attachment-smoke.mjs
@@ -124,6 +128,17 @@ For an end-to-end check against the real unpacked extension (no live provider ac
 ```bash
 node tests/submit-smoke.mjs
 ```
+
+## Automated Maintenance (Sandcastle)
+
+Issues labelled `Sandcastle` can be implemented and reviewed by two Claude Code agents in an isolated Docker worktree. Each run processes at most one issue and leaves closure and merge decisions to a human.
+
+```bash
+npm install
+npm run sandcastle
+```
+
+Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentication uses the blank declarations in `.sandcastle/.env` with fallback to the user's `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN` environment variables.
 
 ## Optional: Screenshot Hotkey (Windows)
 

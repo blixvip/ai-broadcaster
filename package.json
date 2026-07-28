@@ -1,0 +1,30 @@
+{
+  "name": "ai-broadcaster",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Run named workspaces that broadcast prompts and images to free-tier AI chats — one message, many providers, at once.",
+  "main": "background.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "sandcastle": "tsx .sandcastle/main.mts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wasely/ai-broadcaster.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/wasely/ai-broadcaster/issues"
+  },
+  "homepage": "https://github.com/wasely/ai-broadcaster#readme",
+  "devDependencies": {
+    "@ai-hero/sandcastle": "^0.12.0",
+    "tsx": "^4.23.1"
+  }
+}
