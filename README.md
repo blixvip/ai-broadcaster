@@ -26,13 +26,14 @@ AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat si
 - **Provider panels embedded in a workspace tab** (`workspace.html`), plus a lightweight popup (`popup.html`) for quick single-shot prompts.
 - **Image and PDF attachments** — up to 8 files per broadcast, 20 MB per file, 48 MB combined; validated locally before dispatch (`content.js`).
 - **Clipboard grab hotkeys** — `Alt+Shift+V` pastes clipboard image/text into the composer, `Alt+Shift+G` pastes and immediately broadcasts (`manifest.json` commands, `grab.js`, `offscreen.js`).
+- **No window control** — the extension never focuses, minimizes, maximizes, resizes, or moves Chrome windows. Explicitly opening a workspace creates one tab; background grabs create an inactive tab only when needed.
 - **Delivery verification per panel**, not just "clicked submit" — each panel is confirmed via evidence such as a new user-message wrapper, a stop-generation control appearing, or new assistant activity before the shared draft is cleared (`delivery-protocol.js`).
 - **Concurrent per-provider timeout tiers** (A/B/C) so slower or shadow-DOM-heavy providers get more time without slowing down faster ones — see [`PROVIDER_AUTOMATION.md`](PROVIDER_AUTOMATION.md).
 - **Local-only telemetry** — attempt/verified/failed counters kept in `chrome.storage` for diagnosing delivery issues, never transmitted off-device (`telemetry.js`).
 
 ## Registered Providers
 
-Full detail, including timeout tiers and hostnames, is in [`PROVIDER_AUTOMATION.md`](PROVIDER_AUTOMATION.md). As of `manifest.json` v1.5.2:
+Full detail, including timeout tiers and hostnames, is in [`PROVIDER_AUTOMATION.md`](PROVIDER_AUTOMATION.md). As of `manifest.json` v1.5.3:
 
 Gemini, DeepSeek, Le Chat (Mistral), Grok (x.com/grok.com), Perplexity, You.com, Duck.ai, HuggingChat, Poe, Venice, Arena/LMArena, Google AI Studio, Microsoft Copilot, Qwen, Meta AI, Kimi, Blackbox AI.
 
@@ -70,8 +71,8 @@ Declared in `manifest.json`:
 | `declarativeNetRequest` | Apply static iframe/header rules (`rules/ai_frame_rules.json`) so providers can be embedded as frames. |
 | `storage` | Persist workspace state and local telemetry. |
 | `clipboardRead`, `offscreen` | Read clipboard image/text via an offscreen document for the grab hotkeys (`offscreen.js`) — a service worker can't read the clipboard directly. |
-| `browsingData` | TODO: confirm exact use — not covered in `PROVIDER_AUTOMATION.md`. |
-| `nativeMessaging` | TODO: confirm exact use — no native messaging host is included in this repository. |
+| `browsingData` | Clear selected provider caches before iframe navigation when preparing embedded panels. |
+| `nativeMessaging` | Send a selected panel response to the optional `com.ai_broadcaster.warp` native host. |
 
 Host permissions and content scripts are scoped to the registered provider domains listed above, plus a broad `http(s)://*/*` match for `grab.js` (the hover-to-grab content script, no `all_frames`).
 
@@ -114,9 +115,11 @@ Tests use Node's built-in test runner (`node:test`) with no test framework depen
 
 ```bash
 npm test
+npm run ui:shot
 
 # Or run an individual verifier:
 node tests/delivery-protocol.test.mjs
+node tests/input-regressions.test.mjs
 node tests/telemetry.test.mjs
 node tests/attachment-smoke.mjs
 node tests/layout-smoke.mjs
@@ -142,7 +145,7 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 
 ## Optional: Screenshot Hotkey (Windows)
 
-`screenshot-to-broadcaster.ahk` (AutoHotkey v2) adds a system-wide `Ctrl+Alt+Shift+V` hotkey that screenshots the monitor under your mouse, focuses Chrome, and fires the extension's `Alt+Shift+V` grab command — because Chrome extensions can't bind a `Ctrl+Alt+...` shortcut directly. Requires [AutoHotkey v2](https://www.autohotkey.com/) installed separately; this script is not required to use the extension.
+`screenshot-to-broadcaster.ahk` (AutoHotkey v2) adds a system-wide `Ctrl+Alt+Shift+V` hotkey that screenshots the monitor under your mouse and leaves the image on the clipboard. It never activates Chrome or sends keystrokes; paste the image into the broadcaster when ready. The script is optional.
 
 ## Privacy
 
@@ -152,9 +155,8 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 
 ## Known Limitations
 
-- Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`.
+- Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`. **TODO:** run the authenticated live-provider matrix after loading this checkout into the user's normal Chrome profile; automated fixture and UI-shell checks do not prove current third-party DOM compatibility.
 - Closed shadow roots cannot be traversed for composer discovery.
-- `browsingData` and `nativeMessaging` permissions are declared but their exact usage is not documented — TODO: confirm before auditing the permission list further.
 - No CI workflow is configured in this repository.
 
 ## License

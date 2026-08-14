@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -29,6 +30,13 @@ const { chromium } = loadPlaywright();
 const runDir = await mkdtemp(path.join(os.tmpdir(), 'aib-submit-probe-'));
 const profilePath = path.join(runDir, 'profile');
 const screenshotPath = path.join(runDir, 'workspace.png');
+const browserExecutable = [
+  process.env.AIB_CHROME_PATH,
+  chromium.executablePath(),
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'
+].filter(Boolean).find(existsSync);
+if (!browserExecutable) throw new Error('Chrome or Playwright Chromium executable not found.');
 
 // These controlled provider pages exercise the real unpacked extension, iframe
 // registry, workspace broadcast, content-script injection, and submit behavior
@@ -186,12 +194,13 @@ function unconfirmedButtonFixture() {
 }
 
 const context = await chromium.launchPersistentContext(profilePath, {
-  headless: false,
-  executablePath: chromium.executablePath(),
+  headless: process.env.AIB_HEADLESS === '1',
+  executablePath: browserExecutable,
   viewport: { width: 1600, height: 1000 },
   args: [
     `--disable-extensions-except=${extensionPath}`,
     `--load-extension=${extensionPath}`,
+    '--window-position=-32000,-32000',
     '--no-first-run',
     '--no-default-browser-check'
   ]

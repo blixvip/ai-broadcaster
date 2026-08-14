@@ -12,6 +12,7 @@ out/
 .parcel-cache/
 .vite/
 coverage/
+artifacts/
 __pycache__/
 *.pyc
 .pytest_cache/

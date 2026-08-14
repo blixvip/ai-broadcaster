@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI Broadcaster</title>
   <link rel="icon" type="image/png" href="icons/icon32.png">
+  <link rel="stylesheet" href="tokens.css">
   <link rel="stylesheet" href="workspace.css">
 </head>
 <body>
@@ -38,9 +39,6 @@
         <button type="button" class="toolbar-btn new-workspace-btn" id="newWorkspaceBtn"
           title="Open another independent AI Broadcaster workspace">
           <span class="plus">+</span><span>NEW WORKSPACE</span>
-        </button>
-        <button type="button" class="toolbar-btn fs-btn" id="fsBtn" title="Toggle fullscreen" aria-label="Toggle fullscreen">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 0 1-1v-4"/></svg>
         </button>
       </div>
     </header>
@@ -82,7 +80,6 @@
         <div class="image-strip" id="imageStrip"></div>
         <textarea id="prompt" rows="1" placeholder="Broadcast a message to every active model…"
           spellcheck="true" aria-label="Broadcast message"></textarea>
-        <span class="send-hint">ENTER</span>
         <button id="sendBtn" class="send-btn" type="submit" aria-label="Broadcast to all panels">
           <span>SEND</span>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 13-7-4 14-3-5-6-2Z"/><path d="m11 14 7-9"/></svg>

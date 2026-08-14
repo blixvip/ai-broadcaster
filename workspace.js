@@ -28,6 +28,7 @@ const WORKSPACE_INSTANCE_ID = WORKSPACE_PARAMS.get('id') || (() => {
 })();
 const WORKSPACE_TITLE_KEY = `aib_workspace_title_${WORKSPACE_INSTANCE_ID}`;
 const WORKSPACE_LAYOUT_KEY = `aib_workspace_layout_${WORKSPACE_INSTANCE_ID}`;
+const WORKSPACE_STATE_KEY = `aib_workspace_state_${WORKSPACE_INSTANCE_ID}`;
 
 // Each panel registers a readiness monitor. background.js forwards trusted
 // content-script `panelAlive` messages to the owning workspace tab.
@@ -42,7 +43,6 @@ const el = {
   splitX:     document.getElementById('splitHandleX'),
   splitY:     document.getElementById('splitHandleY'),
   splitNode:  document.getElementById('splitNode'),
-  fsBtn:      document.getElementById('fsBtn'),
   dashboard:  document.getElementById('dashboardBtn'),
   focusMode:  document.getElementById('focusModeBtn'),
   panelReadout: document.getElementById('panelReadout'),
@@ -254,6 +254,30 @@ async function loadWorkspaceLayout() {
 
 function saveWorkspaceLayout() {
   return chrome.storage.local.set({ [WORKSPACE_LAYOUT_KEY]: { x: splitX, y: splitY } });
+}
+
+function saveWorkspaceState() {
+  return chrome.storage.local.set({
+    [WORKSPACE_STATE_KEY]: {
+      count,
+      selectedKeys: selectedKeys.slice(0, count)
+    }
+  });
+}
+
+async function loadWorkspaceState() {
+  try {
+    const stored = await chrome.storage.local.get(WORKSPACE_STATE_KEY);
+    const state = stored[WORKSPACE_STATE_KEY];
+    if (!state || !Array.isArray(state.selectedKeys)) return false;
+    const validKeys = state.selectedKeys.filter(key => PROVIDERS.some(provider => provider.key === key));
+    if (!validKeys.length) return false;
+    count = PANEL_COUNTS.includes(state.count) ? state.count : Math.min(Math.max(validKeys.length, 2), 6);
+    selectedKeys = validKeys.slice(0, count);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +513,20 @@ const PANEL_STATE_LABELS = {
   not_ready: 'NOT READY'
 };
 
+function deliveryReasonLabel(reason = '') {
+  const value = String(reason).replace(/^no_input:/, 'Input not found · ').replace(/_/g, ' ');
+  const friendly = {
+    login_required: 'Sign in required',
+    text_not_inserted: 'Input rejected text',
+    attachment_not_ready: 'Attachment not ready',
+    generation_did_not_stop: 'Could not stop current response',
+    evidence_timeout: 'Sent; acceptance unconfirmed',
+    weak_evidence_only: 'Sent; verify in panel',
+    frame_busy: 'Panel is busy'
+  }[reason];
+  return friendly || value;
+}
+
 function deliveryStateForLifecycle(state) {
   if (['received', 'preparing'].includes(state)) return 'preparing';
   if (['input_ready', 'injecting_text', 'text_ready'].includes(state)) return 'injecting';
@@ -509,7 +547,12 @@ function setPanelDeliveryState(panelId, state, details = {}) {
   controller.state = next;
   controller.panel.dataset.deliveryState = next;
   controller.liveState.textContent = PANEL_STATE_LABELS[next];
-  controller.liveState.title = details.reason || details.title || PANEL_STATE_LABELS[next];
+  const reason = details.reason || details.title || '';
+  controller.liveState.title = reason || PANEL_STATE_LABELS[next];
+  controller.stateDetail.textContent = ['failed', 'unverified', 'not_ready'].includes(next)
+    ? deliveryReasonLabel(reason)
+    : '';
+  controller.stateDetail.hidden = !controller.stateDetail.textContent;
   controller.retryButton.hidden = !details.retry?.safe;
   controller.retryButton.disabled = false;
   controller.retryButton.title = details.retry?.safe
@@ -553,6 +596,9 @@ function buildPanel(id, key) {
   const liveState = document.createElement('span');
   liveState.className = 'panel-live-state';
   liveState.textContent = 'IDLE';
+  const stateDetail = document.createElement('span');
+  stateDetail.className = 'panel-state-detail';
+  stateDetail.hidden = true;
   brand.append(logo, liveDot, select, liveState);
 
   const urlInput = document.createElement('input');
@@ -565,7 +611,7 @@ function buildPanel(id, key) {
     '<svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
   const reloadBtn = makePanelButton('panel-btn', 'Reload panel',
     '<svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></svg>');
-  const maximizeBtn = makePanelButton('panel-btn panel-maximize', 'Maximize panel',
+  const soloBtn = makePanelButton('panel-btn panel-solo', 'Focus panel',
     '<svg viewBox="0 0 24 24"><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 0 1-1v-4"/></svg>');
   const warpBtn = makePanelButton('panel-btn panel-btn-warp', 'Send latest response to Warp (Shift+click to choose)',
     '<span>WARP</span><svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
@@ -574,7 +620,7 @@ function buildPanel(id, key) {
   retryBtn.hidden = true;
   const panelActions = document.createElement('div');
   panelActions.className = 'panel-actions';
-  panelActions.append(goBtn, reloadBtn, retryBtn, maximizeBtn, warpBtn);
+  panelActions.append(goBtn, reloadBtn, retryBtn, soloBtn, warpBtn);
 
   const frame = document.createElement('iframe');
   frame.className = 'panel-frame';
@@ -595,6 +641,7 @@ function buildPanel(id, key) {
     panel,
     frame,
     liveState,
+    stateDetail,
     retryButton: retryBtn,
     state: 'idle',
     lastResult: null
@@ -709,6 +756,7 @@ function buildPanel(id, key) {
     activeDelivery = null;
     selectedKeys[id] = select.value;
     const p2 = providerByKey(select.value);
+    saveWorkspaceState().catch(() => {});
     updatePanelIdentity(p2);
     urlInput.value = p2.url;
     showStatus(`Loading ${p2.label}…`);
@@ -730,6 +778,7 @@ function buildPanel(id, key) {
     if (matchedKey) {
       selectedKeys[id] = matchedKey;
       select.value = matchedKey;
+      saveWorkspaceState().catch(() => {});
     }
     await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(selectedKeys[id])]);
     navigateFrame(url);
@@ -757,13 +806,19 @@ function buildPanel(id, key) {
     sendPanelToWarp(frame, label(), event.shiftKey);
   });
 
-  maximizeBtn.addEventListener('click', () => {
-    const maximizing = !panel.classList.contains('is-maximized');
-    for (const other of el.grid.querySelectorAll('.panel')) other.classList.remove('is-maximized');
-    panel.classList.toggle('is-maximized', maximizing);
-    el.gridShell.classList.toggle('has-maximized-panel', maximizing);
-    maximizeBtn.classList.toggle('active', maximizing);
-    maximizeBtn.title = maximizing ? 'Restore panel' : 'Maximize panel';
+  soloBtn.addEventListener('click', () => {
+    const soloing = !panel.classList.contains('is-solo');
+    for (const other of el.grid.querySelectorAll('.panel')) other.classList.remove('is-solo');
+    for (const button of el.grid.querySelectorAll('.panel-solo')) {
+      button.classList.remove('active');
+      button.title = 'Focus panel';
+      button.setAttribute('aria-label', button.title);
+    }
+    panel.classList.toggle('is-solo', soloing);
+    el.gridShell.classList.toggle('has-solo-panel', soloing);
+    soloBtn.classList.toggle('active', soloing);
+    soloBtn.title = soloing ? 'Restore grid' : 'Focus panel';
+    soloBtn.setAttribute('aria-label', soloBtn.title);
   });
 
   panel.addEventListener('pointerenter', () => {
@@ -771,7 +826,7 @@ function buildPanel(id, key) {
   });
   head.addEventListener('pointerdown', () => setFocusedPanel(id));
 
-  head.append(brand, urlInput, panelActions);
+  head.append(brand, stateDetail, urlInput, panelActions);
   panel.append(head, frame);
 
   setPanelDeliveryState(panelId, 'preparing');
@@ -797,7 +852,7 @@ function renderGrid() {
     el.grid.style.removeProperty('grid-template-rows');
   }
   el.grid.innerHTML = '';
-  el.gridShell.classList.remove('has-maximized-panel');
+  el.gridShell.classList.remove('has-solo-panel');
   selectedKeys.slice(0, count).forEach((key, id) => {
     el.grid.appendChild(buildPanel(id, key));
   });
@@ -1157,6 +1212,27 @@ function createDelivery(text, images, promptSnapshot, imageIds) {
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
+el.dashboard.addEventListener('click', async () => {
+  el.dashboard.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'getTelemetry' });
+    if (!response?.ok) throw new Error(response?.reason || 'Insights unavailable');
+    const ranked = (response.ranking || []).filter(item => item.attempts > 0).slice(0, 3);
+    if (!ranked.length) {
+      showStatus('Insights will rank providers after verified broadcasts.');
+      return;
+    }
+    const summary = ranked.map((item, index) =>
+      `${index + 1}. ${providerByKey(item.id)?.label || item.id} ${item.smartScore}`
+    ).join('  ·  ');
+    showStatus(`Smart rank · ${summary}`, 'success');
+  } catch (error) {
+    showStatus(error?.message || 'Could not load Insights.', 'error');
+  } finally {
+    el.dashboard.disabled = false;
+  }
+});
+
 el.focusMode.addEventListener('click', () => {
   focusModeEnabled = !focusModeEnabled;
   renderFocusMode();
@@ -1248,15 +1324,11 @@ el.panelCount.addEventListener('click', async event => {
   }
   activeDelivery = null;
   setCount(next);
+  saveWorkspaceState().catch(() => {});
   showStatus('Preparing panels…');
   await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey));
   showStatus('');
   renderGrid();
-});
-
-el.fsBtn.addEventListener('click', () => {
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  else document.documentElement.requestFullscreen().catch(() => {});
 });
 
 el.attachBtn.addEventListener('click', () => el.imageInput.click());
@@ -1332,6 +1404,7 @@ async function init() {
   workspaceTabId = Number.isInteger(claim?.tabId) ? claim.tabId : null;
   await loadWorkspaceTitle();
   await loadWorkspaceLayout();
+  const hasSavedState = await loadWorkspaceState();
 
   let seed = null;
   try {
@@ -1339,13 +1412,13 @@ async function init() {
     seed = stored?.aib_workspace_seed || null;
   } catch {}
 
-  if (seed && Array.isArray(seed.panels) && seed.panels.length) {
+  if (!hasSavedState && seed && Array.isArray(seed.panels) && seed.panels.length) {
     count = PANEL_COUNTS.includes(seed.count) ? seed.count : Math.min(Math.max(seed.panels.length, 2), 6);
     selectedKeys = seed.panels.map(p => keyFromUrl(typeof p === 'string' ? p : p?.url)).filter(Boolean);
   }
 
   const requestedCount = Number(WORKSPACE_PARAMS.get('count'));
-  if (PANEL_COUNTS.includes(requestedCount)) count = requestedCount;
+  if (!hasSavedState && PANEL_COUNTS.includes(requestedCount)) count = requestedCount;
 
   if (selectedKeys.length < count) {
     const seedKeys = DEFAULT_PANEL_URLS.map(keyFromUrl).filter(Boolean);
@@ -1353,6 +1426,7 @@ async function init() {
     while (selectedKeys.length < count) selectedKeys.push(filler[selectedKeys.length] || randomKeys(1)[0]);
   }
   selectedKeys = selectedKeys.slice(0, count);
+  saveWorkspaceState().catch(() => {});
 
   // Arm frame rules and clear selected-provider caches before iframe navigation.
   showStatus('Preparing panels…');

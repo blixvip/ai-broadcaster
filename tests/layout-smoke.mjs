@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -22,14 +23,23 @@ function loadPlaywright() {
 const { chromium } = loadPlaywright();
 const runDir = await mkdtemp(path.join(os.tmpdir(), 'aib-layout-smoke-'));
 const profilePath = path.join(runDir, 'profile');
+const browserExecutable = [
+  process.env.AIB_CHROME_PATH,
+  chromium.executablePath(),
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'
+].filter(Boolean).find(existsSync);
+
+if (!browserExecutable) throw new Error('Chrome or Playwright Chromium executable not found.');
 
 const context = await chromium.launchPersistentContext(profilePath, {
-  headless: false,
-  executablePath: chromium.executablePath(),
+  headless: process.env.AIB_HEADLESS === '1',
+  executablePath: browserExecutable,
   viewport: { width: 1600, height: 1000 },
   args: [
     `--disable-extensions-except=${extensionPath}`,
     `--load-extension=${extensionPath}`,
+    '--window-position=-32000,-32000',
     '--no-first-run',
     '--no-default-browser-check'
   ]
@@ -201,6 +211,14 @@ try {
   const restoredSplit = await splitPage.locator('#gridShell').evaluate(element =>
     parseFloat(getComputedStyle(element).getPropertyValue('--split-x')) / 100
   );
+  const firstSoloButton = splitPage.locator('.panel-solo').first();
+  await firstSoloButton.click();
+  await splitPage.waitForFunction(() => document.querySelector('#gridShell')?.classList.contains('has-solo-panel'));
+  const soloVisiblePanels = await splitPage.locator('#grid .panel:visible').count();
+  const soloButtonTitle = await firstSoloButton.getAttribute('title');
+  await firstSoloButton.click();
+  await splitPage.waitForFunction(() => !document.querySelector('#gridShell')?.classList.contains('has-solo-panel'));
+  const restoredVisiblePanels = await splitPage.locator('#grid .panel:visible').count();
   const splitScreenshotPath = path.join(runDir, 'split-persisted.png');
   await splitPage.screenshot({ path: splitScreenshotPath, fullPage: true });
   await splitPage.close();
@@ -211,11 +229,20 @@ try {
     screenshotPath: splitScreenshotPath,
     passed: Math.abs(draggedSplit - 0.64) < 0.04 && Math.abs(restoredSplit - draggedSplit) < 0.01
   };
+  const soloPanel = {
+    soloVisiblePanels,
+    soloButtonTitle,
+    restoredVisiblePanels,
+    passed: soloVisiblePanels === 1
+      && soloButtonTitle === 'Restore grid'
+      && restoredVisiblePanels === 4
+  };
   const passed = results.every(result => Object.values(result.checks).every(Boolean))
     && splitPersistence.passed
+    && soloPanel.passed
     && consoleErrors.length === 0;
 
-  console.log(JSON.stringify({ passed, extensionId, results, splitPersistence, consoleErrors, runDir }, null, 2));
+  console.log(JSON.stringify({ passed, extensionId, results, splitPersistence, soloPanel, consoleErrors, runDir }, null, 2));
   if (!passed) process.exitCode = 1;
 } finally {
   await context.close();

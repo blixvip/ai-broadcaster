@@ -550,7 +550,7 @@ const PLATFORMS = {
       'button[class*="send" i]',
       'button[type="submit"]'
     ],
-    type: 'contenteditable',
+    type: 'auto',
     group: 'C'
   },
   'www.kimi.ai': {
@@ -569,7 +569,7 @@ const PLATFORMS = {
       'button[class*="send" i]',
       'button[type="submit"]'
     ],
-    type: 'contenteditable',
+    type: 'auto',
     group: 'C'
   },
   'kimi.moonshot.cn': {
@@ -585,7 +585,7 @@ const PLATFORMS = {
       'button[aria-label*="Send" i]',
       'button[type="submit"]'
     ],
-    type: 'contenteditable',
+    type: 'auto',
     group: 'C'
   },
   'www.blackbox.ai': {
@@ -836,7 +836,9 @@ function isUsable(el) {
     && style.display !== 'none'
     && style.pointerEvents !== 'none'
     && !el.disabled
+    && !el.readOnly
     && el.getAttribute('aria-disabled') !== 'true'
+    && el.getAttribute('aria-readonly') !== 'true'
     && el.getAttribute('data-disabled') !== 'true'
     && !el.closest?.('[inert],[aria-hidden="true"]');
 }
@@ -915,7 +917,9 @@ function isInExcludedRegion(el) {
 }
 
 function isEditableType(el) {
+  const type = (el.getAttribute?.('type') || '').toLowerCase();
   return el.tagName === 'TEXTAREA'
+    || (el.tagName === 'INPUT' && ['text', 'search', ''].includes(type))
     || el.isContentEditable
     || el.getAttribute?.('contenteditable') === 'true'
     || el.getAttribute?.('contenteditable') === 'plaintext-only'
@@ -2144,16 +2148,10 @@ async function observeResponseCompletion(context, config, inputEl, baselineAssis
 // ---------------------------------------------------------------------------
 
 async function preClickActivate(config) {
-  for (const sel of config.inputSels.slice(0, 6)) {
-    try {
-      const el = queryAllDeep(sel)[0];
-      if (el && isUsable(el)) {
-        clickElement(el);
-        await sleep(200);
-        return;
-      }
-    } catch {}
-  }
+  const input = findBestInput(config.inputSels.slice(0, 6));
+  if (!input) return;
+  clickElement(input);
+  await sleep(200);
 }
 
 // ---------------------------------------------------------------------------

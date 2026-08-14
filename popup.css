@@ -1,31 +1,33 @@
+/* Hallmark · macrostructure: Workbench · tone: technical-utilitarian · anchor hue: cyan */
 * { box-sizing:border-box; margin:0; padding:0; }
 :root {
   color-scheme:dark;
-  --bg:#0b0c0e;
-  --surface:#121317;
-  --surface-2:#18191e;
-  --line:rgba(255,255,255,.09);
-  --line-strong:rgba(255,255,255,.15);
-  --text:#f1f1f3;
-  --soft:#aaadb5;
-  --muted:#656871;
-  --active:#9eeaf0;
-  --success:#64dda8;
-  --danger:#ff7b87;
+  --bg:var(--color-canvas);
+  --surface:var(--color-surface);
+  --surface-2:var(--color-surface-raised);
+  --line:var(--color-line);
+  --line-strong:var(--color-line-strong);
+  --text:var(--color-text);
+  --soft:var(--color-text-soft);
+  --muted:var(--color-muted);
+  --active:var(--color-accent);
+  --success:var(--color-success);
+  --danger:var(--color-danger);
 }
 body {
   width:380px;
   min-height:520px;
-  overflow:hidden;
+  overflow-x:hidden;
+  overflow-y:auto;
   background:var(--bg);
   color:var(--text);
-  font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-family:var(--font-body);
   font-size:13px;
   -webkit-font-smoothing:antialiased;
 }
 button,textarea,input { font:inherit; color:inherit; outline:0; }
 button { cursor:pointer; }
-button:focus-visible,textarea:focus-visible { outline:2px solid rgba(158,234,240,.6); outline-offset:2px; }
+button:focus-visible,textarea:focus-visible { outline:2px solid var(--color-focus); outline-offset:2px; }
 .container { display:flex; flex-direction:column; gap:10px; padding:13px; }
 .header {
   height:34px;
@@ -41,8 +43,8 @@ button:focus-visible,textarea:focus-visible { outline:2px solid rgba(158,234,240
 .textarea-wrap { position:relative; overflow:hidden; border-radius:8px; }
 #prompt {
   width:100%;
-  min-height:140px;
-  resize:vertical;
+  min-height:156px;
+  resize:none;
   padding:11px 40px 11px 11px;
   border-radius:8px;
   color:var(--text);

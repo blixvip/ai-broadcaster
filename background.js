@@ -222,9 +222,6 @@ async function openWorkspaceTab(options = {}) {
 
   const tab = await chrome.tabs.create({ url: url.href, active: options.active !== false });
   if (Number.isInteger(tab.id)) await rememberWorkspaceTab(tab.id);
-  if (options.active !== false) {
-    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
-  }
   return { windowId: tab.windowId, tabId: tab.id, instanceId, reused: false };
 }
 
