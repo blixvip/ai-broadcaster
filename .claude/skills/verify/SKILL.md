@@ -33,7 +33,7 @@ node tests/attachment-smoke.mjs
 
 This drives text-only, image-only with two images, and text-plus-image broadcasts through both contenteditable/button and textarea/Enter provider fixtures. A passing run proves exact per-provider attachment counts, attachment order, strong image-only evidence, and workspace cleanup after verification.
 
-Playwright resolution order is `AIB_PLAYWRIGHT_PATH`, local `node_modules/playwright`, then this machine's existing `C:\code\brgod\node_modules\playwright`.
+Playwright resolution order is `AIB_PLAYWRIGHT_PATH`, local `node_modules/playwright`, then this machine's existing `C:\live\brgod\node_modules\playwright`.
 
 ## Live-provider boundary
 

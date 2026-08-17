@@ -12,7 +12,7 @@ function loadPlaywright() {
   const candidates = [
     process.env.AIB_PLAYWRIGHT_PATH,
     path.join(extensionPath, 'node_modules', 'playwright'),
-    'C:/code/brgod/node_modules/playwright'
+    'C:/live/brgod/node_modules/playwright'
   ].filter(Boolean);
 
   for (const candidate of candidates) {
