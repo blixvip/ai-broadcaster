@@ -1,6 +1,7 @@
 'use strict';
 
 const DELIVERY = globalThis.AIBDeliveryProtocol;
+const PROMPT_POLICY = globalThis.AIBPromptPolicy;
 const AIB_HOSTS = new Set(globalThis.AIB_AI_HOSTS || []);
 const ATTEMPT_CACHE_LIMIT = 64;
 const ATTEMPT_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -1656,8 +1657,8 @@ function leafElements(elements) {
   return elements.filter(el => !elements.some(other => other !== el && el.contains(other)));
 }
 
-// A provider often exposes one image as a wrapper, thumbnail and remove button.
-// Count the largest category instead of adding those duplicate DOM signals.
+// A provider often exposes one attachment as a wrapper, thumbnail and remove
+// button. Combine distinct wrappers/media while avoiding those duplicate signals.
 function attachmentState(config, inputEl) {
   const roots = composerRoots(inputEl);
   if (!roots.length) return { count: 0, readyCount: 0, removeControls: [] };
@@ -1693,11 +1694,24 @@ function attachmentState(config, inputEl) {
     const nestedMedia = queryAllDeep('img,canvas,video', el);
     return !nestedMedia.length || nestedMedia.every(attachmentMediaReady);
   });
+  const standaloneMedia = visibleMedia.filter(mediaElement =>
+    !visibleWrappers.some(wrapper => wrapper.contains(mediaElement)));
+  const readyStandaloneMedia = standaloneMedia.filter(attachmentMediaReady);
+  const extraControlUnits = Math.max(0, visibleControls.length - visibleMedia.length);
+  const groupedCount = visibleWrappers.length + standaloneMedia.length;
+  const groupedReadyCount = readyWrappers.length + readyStandaloneMedia.length;
 
-  const count = Math.max(visibleMedia.length, visibleControls.length, visibleWrappers.length);
-  const readyCount = visibleMedia.length
-    ? readyMedia.length
-    : Math.max(visibleControls.length, readyWrappers.length);
+  const count = Math.max(
+    visibleMedia.length,
+    visibleControls.length,
+    visibleWrappers.length,
+    groupedCount
+  );
+  const readyCount = Math.min(count, Math.max(
+    readyMedia.length + extraControlUnits,
+    readyWrappers.length,
+    groupedReadyCount
+  ));
   return { count, readyCount, removeControls: visibleControls };
 }
 
@@ -1895,17 +1909,18 @@ function userTurnElements(config) {
   })).filter(elVisible);
 }
 
+const TURN_ATTACHMENT_SELECTOR = 'img,canvas,video,[data-testid*="attachment" i],[data-testid*="file" i],[data-testid*="image" i],[class*="attachment" i],[class*="file-preview" i]';
+
+function turnHasAttachment(element) {
+  try {
+    return queryAllDeep(TURN_ATTACHMENT_SELECTOR, element).some(elVisible);
+  } catch {
+    return false;
+  }
+}
+
 function imageBearingTurnCount(elements) {
-  return elements.filter(element => {
-    try {
-      return queryAllDeep(
-        'img,canvas,video,[data-testid*="attachment" i],[data-testid*="file" i],[data-testid*="image" i],[class*="attachment" i],[class*="file-preview" i]',
-        element
-      ).some(elVisible);
-    } catch {
-      return false;
-    }
-  }).length;
+  return elements.filter(turnHasAttachment).length;
 }
 
 function assistantState(config) {
@@ -1922,12 +1937,14 @@ function assistantState(config) {
 
 function captureSubmitSnapshot(config, inputEl, expectedText) {
   const users = userTurnElements(config);
+  const matchingUsers = users.filter(element => comparableTextContains(elPlainText(element), expectedText));
   const assistant = assistantState(config);
   return {
     url: location.href,
     userTurns: users.length,
-    matchingUserTurns: users.filter(element => comparableTextContains(elPlainText(element), expectedText)).length,
+    matchingUserTurns: matchingUsers.length,
     imageUserTurns: imageBearingTurnCount(users),
+    matchingAttachmentUserTurns: matchingUsers.filter(turnHasAttachment).length,
     assistantCount: assistant.count,
     assistantText: assistant.text,
     stopVisible: !!findStopButton(config, inputEl?.isConnected ? inputEl : null),
@@ -2292,7 +2309,7 @@ function finishAttempt(context, outcome, reason, options = {}) {
 async function handleInject(data) {
   responseTrackerToken += 1;
   const context = createAttemptContext(data);
-  const text = String(data.text || '');
+  const text = PROMPT_POLICY.applyProviderPromptPolicy(location.hostname, data.text);
   const images = imagePayloadsFromData(data);
   const config = getConfig();
   markLifecycle(context, 'received');
@@ -2518,11 +2535,117 @@ function announceAlive() {
   }).catch(() => null);
 }
 
+const READINESS_TIMEOUT_MS = 20000;
+const READINESS_RETRY_MS = 30000;
+const READINESS_RECHECK_MS = 5000;
+let readinessProbeGeneration = 0;
+let readinessRetryTimer = null;
+let lastReadinessAnnouncement = '';
+let readinessAnnouncementQueue = Promise.resolve();
+
+function readinessBlockReason() {
+  const text = `${document.title || ''}\n${document.body?.textContent?.slice(0, 12000) || ''}`.toLowerCase();
+  if (/\b403 error\b|request blocked|access denied/.test(text)) return 'Provider blocked the embedded request';
+  if (/security verification|verify you are human|checking your browser|cloudflare ray id|just a moment/.test(text)) {
+    return 'Provider security verification is blocking the composer';
+  }
+  if (/not available (?:in|for) your (?:country|region)|unsupported region/.test(text)) {
+    return 'Provider is unavailable in this region';
+  }
+  return '';
+}
+
+function announceReadiness(state, reason = '') {
+  const binding = bindingFields();
+  const signature = [state, reason, binding.panelId, binding.panelEpoch].join('|');
+  const payload = {
+    action: 'panelReadiness',
+    hostname: location.hostname,
+    state,
+    reason,
+    ...binding
+  };
+  const task = readinessAnnouncementQueue.catch(() => null).then(async () => {
+    if (signature === lastReadinessAnnouncement) return { ok: true, deduplicated: true };
+    let response = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      response = await chrome.runtime.sendMessage(payload).catch(() => null);
+      if (response?.ok === true) {
+        lastReadinessAnnouncement = signature;
+        return response;
+      }
+      if (attempt < 2) await sleep(200 * (attempt + 1));
+    }
+    return response;
+  });
+  readinessAnnouncementQueue = task;
+  return task;
+}
+
+function scheduleReadinessProbe(delay, recheck = false) {
+  clearTimeout(readinessRetryTimer);
+  readinessRetryTimer = setTimeout(() => startReadinessProbe(recheck), delay);
+}
+
+function startReadinessProbe(recheck = false) {
+  clearTimeout(readinessRetryTimer);
+  readinessRetryTimer = null;
+  const generation = ++readinessProbeGeneration;
+  const startedAt = Date.now();
+
+  void (async () => {
+    const config = getConfig();
+    if (!config) {
+      await announceReadiness('not_ready', 'Provider automation is not configured');
+      return;
+    }
+
+    // A READY panel remains under passive supervision. Check the full selector
+    // set before changing UI state so healthy panels never flicker to CHECKING.
+    if (recheck) {
+      const input = findBestInput(config.inputSels);
+      if (input && isUsable(input)) {
+        await announceReadiness('ready');
+        if (generation === readinessProbeGeneration) {
+          scheduleReadinessProbe(READINESS_RECHECK_MS, true);
+        }
+        return;
+      }
+    }
+
+    await announceReadiness('checking');
+    let failureReason = '';
+    while (generation === readinessProbeGeneration && Date.now() - startedAt < READINESS_TIMEOUT_MS) {
+      const elapsed = Date.now() - startedAt;
+      const selectors = elapsed < 2500 ? config.directInputSels : config.inputSels;
+      const input = findBestInput(selectors);
+      if (input && isUsable(input)) {
+        await announceReadiness('ready');
+        if (generation === readinessProbeGeneration) {
+          scheduleReadinessProbe(READINESS_RECHECK_MS, true);
+        }
+        return;
+      }
+      failureReason = readinessBlockReason() || (pageNeedsLogin() ? 'Sign in required' : failureReason);
+      await sleep(750);
+    }
+
+    if (generation !== readinessProbeGeneration) return;
+    const state = failureReason === 'Sign in required' ? 'login_required' : 'not_ready';
+    await announceReadiness(state, failureReason || `Composer not found on ${location.hostname}`);
+    if (generation === readinessProbeGeneration) {
+      scheduleReadinessProbe(READINESS_RETRY_MS);
+    }
+  })();
+}
+
 registerPanel();
 announceAlive();
+startReadinessProbe();
 window.addEventListener('load', () => {
   registerPanel();
   announceAlive();
+  startReadinessProbe();
 });
 setTimeout(() => {
   registerPanel();
@@ -2544,6 +2667,7 @@ window.addEventListener('message', event => {
       };
       registerPanel();
       announceAlive();
+      startReadinessProbe();
       return;
     }
 

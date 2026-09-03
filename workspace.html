@@ -15,7 +15,10 @@
         <span class="brand-mark"><img src="icons/icon32.png" alt=""></span>
         <span class="brand-copy">
           <strong>AI BROADCASTER</strong>
-          <small>MULTI-MODEL WORKSPACE</small>
+        </span>
+        <span class="readiness" id="readiness" aria-live="polite">
+          <span class="readiness-dot" aria-hidden="true"></span>
+          <span id="readinessLabel">PREPARING</span>
         </span>
       </div>
 
@@ -26,7 +29,6 @@
       </label>
 
       <div class="toolbar-actions">
-        <span class="panel-readout" id="panelReadout">04 PANELS</span>
         <button type="button" class="toolbar-btn dashboard-btn" id="dashboardBtn" title="Open Smart Rank dashboard">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V10M10 19V5M16 19v-7M22 19V8"/></svg>
           <span>INSIGHTS</span>
@@ -47,8 +49,10 @@
       <div class="grid-stage" id="gridShell">
         <!-- Live AI panels (iframes) tiled side by side in ONE page -->
         <section class="grid" id="grid" aria-label="AI panels"></section>
-        <button type="button" class="split-handle split-handle-x" id="splitHandleX" aria-label="Resize panel columns"><span></span></button>
-        <button type="button" class="split-handle split-handle-y" id="splitHandleY" aria-label="Resize panel rows"><span></span></button>
+        <button type="button" class="split-handle split-handle-x" id="splitHandleX" role="separator"
+          aria-label="Resize panel columns" aria-orientation="vertical" aria-valuemin="28" aria-valuemax="72" aria-valuenow="50"><span></span></button>
+        <button type="button" class="split-handle split-handle-y" id="splitHandleY" role="separator"
+          aria-label="Resize panel rows" aria-orientation="horizontal" aria-valuemin="28" aria-valuemax="72" aria-valuenow="50"><span></span></button>
         <span class="split-node" id="splitNode" aria-hidden="true"></span>
       </div>
     </div>
@@ -69,10 +73,8 @@
       <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
 
       <form id="composer" class="composer">
-        <div class="broadcast-live" title="Broadcast channel ready">
-          <span class="live-dot"></span>
-          <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-        </div>
+        <canvas id="composerShader" class="composer-shader" aria-hidden="true"></canvas>
+        <span class="composer-drop-hint" aria-hidden="true">DROP IMAGES OR PDFS TO ATTACH</span>
         <button type="button" class="icon-btn" id="attachBtn" title="Attach images or PDFs" aria-label="Attach images or PDFs">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.2 8.2a5.4 5.4 0 0 1-7.6-7.6l9-9a3.7 3.7 0 0 1 5.3 5.3l-9 9a2.1 2.1 0 0 1-3-3l8.2-8.2"/></svg>
         </button>
@@ -89,8 +91,10 @@
   </main>
 
   <script src="delivery-protocol.js"></script>
+  <script src="attachment-ui.js"></script>
   <script src="provider-marks.js"></script>
   <script src="providers.js"></script>
+  <script src="composer-shader.js"></script>
   <script src="workspace.js"></script>
 </body>
 </html>

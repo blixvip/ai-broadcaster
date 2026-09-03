@@ -73,6 +73,25 @@ function overlapArea(a, b) {
   return width * height;
 }
 
+function instrumentShaderDraws(page) {
+  return page.addInitScript(() => {
+    window.__shaderDraws = 0;
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function getInstrumentedContext(type, ...args) {
+      const context = originalGetContext.call(this, type, ...args);
+      if (type === 'webgl2' && context && !context.__aibInstrumented) {
+        const originalDrawArrays = context.drawArrays.bind(context);
+        context.drawArrays = (...drawArgs) => {
+          window.__shaderDraws += 1;
+          return originalDrawArrays(...drawArgs);
+        };
+        context.__aibInstrumented = true;
+      }
+      return context;
+    };
+  });
+}
+
 try {
   await context.route(/^https:\/\//, route => route.fulfill({
     status: 200,
@@ -90,7 +109,8 @@ try {
 
   const scenarios = [
     ...[2, 3, 4, 5, 6].map(count => ({ name: `wide-${count}`, count, width: 1600, height: 1000 })),
-    ...[2, 4, 6].map(count => ({ name: `compact-${count}`, count, width: 900, height: 780 }))
+    ...[2, 4, 6].map(count => ({ name: `compact-${count}`, count, width: 900, height: 780 })),
+    ...[2, 4, 6].map(count => ({ name: `narrow-${count}`, count, width: 720, height: 760 }))
   ];
   const expectedShape = {
     2: { columns: 2, rows: 1 },
@@ -211,11 +231,91 @@ try {
   const restoredSplit = await splitPage.locator('#gridShell').evaluate(element =>
     parseFloat(getComputedStyle(element).getPropertyValue('--split-x')) / 100
   );
+
+  const splitXHandle = splitPage.locator('#splitHandleX');
+  await splitXHandle.focus();
+  await splitPage.keyboard.press('End');
+  const splitAtEnd = Number(await splitXHandle.getAttribute('aria-valuenow'));
+  await splitPage.keyboard.press('Shift+ArrowLeft');
+  const splitAfterLargeStep = Number(await splitXHandle.getAttribute('aria-valuenow'));
+  await splitPage.keyboard.press('Home');
+  const splitAtHome = Number(await splitXHandle.getAttribute('aria-valuenow'));
+  const splitKeyboard = {
+    splitAtEnd,
+    splitAfterLargeStep,
+    splitAtHome,
+    orientation: await splitXHandle.getAttribute('aria-orientation'),
+    passed: splitAtEnd === 72
+      && splitAfterLargeStep === 67
+      && splitAtHome === 28
+      && await splitXHandle.getAttribute('aria-orientation') === 'vertical'
+  };
+
+  await splitPage.locator('#focusModeBtn').focus();
+  await splitPage.evaluate(() => {
+    void pickWarpPane([
+      { id: 'pane-a', label: 'Pane A', detail: 'First', app: 'Warp', active: true },
+      { id: 'pane-b', label: 'Pane B', detail: 'Second', app: 'Warp', active: false }
+    ]).then(value => { window.__warpPickerResult = value; });
+  });
+  const warpDialog = splitPage.locator('.warp-modal[role="dialog"][aria-modal="true"]');
+  await warpDialog.waitFor();
+  const warpLabelledBy = await warpDialog.getAttribute('aria-labelledby');
+  const warpInitialFocus = await splitPage.evaluate(() => document.activeElement?.value || '');
+  await splitPage.keyboard.press('Shift+Tab');
+  const warpWrappedBackward = await splitPage.evaluate(() => document.activeElement?.textContent?.trim() || '');
+  await splitPage.keyboard.press('Tab');
+  const warpWrappedForward = await splitPage.evaluate(() => document.activeElement?.value || '');
+  await splitPage.keyboard.press('Escape');
+  await warpDialog.waitFor({ state: 'detached' });
+  const warpPicker = {
+    labelled: !!warpLabelledBy,
+    initialFocus: warpInitialFocus,
+    wrappedBackward: warpWrappedBackward,
+    wrappedForward: warpWrappedForward,
+    result: await splitPage.evaluate(() => window.__warpPickerResult),
+    restoredFocus: await splitPage.evaluate(() => document.activeElement?.id || ''),
+    passed: !!warpLabelledBy
+      && warpInitialFocus === 'pane-a'
+      && warpWrappedBackward === 'Paste only'
+      && warpWrappedForward === 'pane-a'
+      && await splitPage.evaluate(() => window.__warpPickerResult) === null
+      && await splitPage.evaluate(() => document.activeElement?.id) === 'focusModeBtn'
+  };
+
+  await splitPage.setViewportSize({ width: 720, height: 700 });
+  await splitPage.locator('#focusModeBtn').click();
+  await splitPage.locator('.panel').nth(2).locator('iframe').focus();
+  await splitPage.waitForTimeout(900);
+  const focusMode = await splitPage.evaluate(() => {
+    const panels = [...document.querySelectorAll('#grid .panel')];
+    return {
+      enabled: document.documentElement.classList.contains('focus-mode'),
+      focused: panels.filter(panel => panel.classList.contains('is-focused')).map(panel => panel.dataset.id),
+      opacities: panels.map(panel => Number(getComputedStyle(panel).opacity))
+    };
+  });
+  focusMode.passed = focusMode.enabled
+    && focusMode.focused.length === 1
+    && focusMode.focused[0] === '2'
+    && focusMode.opacities[2] >= 0.99
+    && focusMode.opacities.filter((_, index) => index !== 2).every(value => value <= 0.3);
+
   const firstSoloButton = splitPage.locator('.panel-solo').first();
   await firstSoloButton.click();
   await splitPage.waitForFunction(() => document.querySelector('#gridShell')?.classList.contains('has-solo-panel'));
   const soloVisiblePanels = await splitPage.locator('#grid .panel:visible').count();
   const soloButtonTitle = await firstSoloButton.getAttribute('title');
+  const soloGeometry = await splitPage.evaluate(() => {
+    const grid = document.querySelector('#grid').getBoundingClientRect();
+    const panel = document.querySelector('#grid .panel.is-solo').getBoundingClientRect();
+    return {
+      grid: { left: grid.left, top: grid.top, right: grid.right, bottom: grid.bottom },
+      panel: { left: panel.left, top: panel.top, right: panel.right, bottom: panel.bottom },
+      horizontalScroll: document.documentElement.scrollWidth - innerWidth,
+      verticalScroll: document.documentElement.scrollHeight - innerHeight
+    };
+  });
   await firstSoloButton.click();
   await splitPage.waitForFunction(() => !document.querySelector('#gridShell')?.classList.contains('has-solo-panel'));
   const restoredVisiblePanels = await splitPage.locator('#grid .panel:visible').count();
@@ -232,17 +332,224 @@ try {
   const soloPanel = {
     soloVisiblePanels,
     soloButtonTitle,
+    soloGeometry,
     restoredVisiblePanels,
     passed: soloVisiblePanels === 1
       && soloButtonTitle === 'Restore grid'
       && restoredVisiblePanels === 4
+      && Math.abs(soloGeometry.grid.left - soloGeometry.panel.left) <= 2
+      && Math.abs(soloGeometry.grid.top - soloGeometry.panel.top) <= 2
+      && Math.abs(soloGeometry.grid.right - soloGeometry.panel.right) <= 2
+      && Math.abs(soloGeometry.grid.bottom - soloGeometry.panel.bottom) <= 2
+      && soloGeometry.horizontalScroll <= 1
+      && soloGeometry.verticalScroll <= 1
+  };
+
+  const retentionPage = await context.newPage();
+  retentionPage.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(`count-retention: ${message.text()}`);
+  });
+  retentionPage.on('pageerror', error => consoleErrors.push(`count-retention: ${String(error)}`));
+  await retentionPage.setViewportSize({ width: 1600, height: 1000 });
+  await retentionPage.goto(`chrome-extension://${extensionId}/workspace.html?id=layout-count-retention&count=4`);
+  await retentionPage.waitForFunction(() => document.querySelectorAll('#grid .panel').length === 4);
+  await Promise.all(retentionPage.frames()
+    .filter(frame => frame.parentFrame() === retentionPage.mainFrame())
+    .map(frame => frame.waitForLoadState('load')));
+  const initialEpochs = await retentionPage.evaluate(() =>
+    [...document.querySelectorAll('#grid .panel')].map(panel => {
+      const frame = panel.querySelector('iframe');
+      frame.dataset.retentionProbe = panel.dataset.id;
+      frame.dataset.probeLoads = '0';
+      frame.addEventListener('load', () => {
+        frame.dataset.probeLoads = String(Number(frame.dataset.probeLoads || 0) + 1);
+      });
+      return panel.dataset.panelEpoch;
+    })
+  );
+
+  await retentionPage.locator('#panelCount button[data-count="6"]').click();
+  await retentionPage.waitForFunction(() => document.querySelectorAll('#grid .panel').length === 6);
+  await Promise.all(retentionPage.frames()
+    .filter(frame => frame.parentFrame() === retentionPage.mainFrame())
+    .map(frame => frame.waitForLoadState('load')));
+  const grownRetention = await retentionPage.evaluate(expectedEpochs =>
+    [...document.querySelectorAll('#grid .panel')].slice(0, 4).map((panel, id) => {
+      const frame = panel.querySelector('iframe');
+      return {
+        id,
+        sameNode: frame.dataset.retentionProbe === String(id),
+        reloads: Number(frame.dataset.probeLoads || 0),
+        sameEpoch: panel.dataset.panelEpoch === expectedEpochs[id]
+      };
+    }), initialEpochs);
+
+  await retentionPage.locator('#panelCount button[data-count="2"]').click();
+  await retentionPage.waitForFunction(() => document.querySelectorAll('#grid .panel').length === 2);
+  await retentionPage.waitForTimeout(200);
+  const shrunkRetention = await retentionPage.evaluate(expectedEpochs =>
+    [...document.querySelectorAll('#grid .panel')].map((panel, id) => {
+      const frame = panel.querySelector('iframe');
+      return {
+        id,
+        sameNode: frame.dataset.retentionProbe === String(id),
+        reloads: Number(frame.dataset.probeLoads || 0),
+        sameEpoch: panel.dataset.panelEpoch === expectedEpochs[id]
+      };
+    }), initialEpochs);
+
+  await retentionPage.waitForFunction(async () => {
+    const tab = await chrome.tabs.getCurrent();
+    const { reg = {} } = await chrome.storage.session.get('reg');
+    return Object.values(reg).filter(frame => frame.tabId === tab.id && frame.panelId).length === 2;
+  });
+  const registryAfterShrink = await retentionPage.evaluate(async () => {
+    const tab = await chrome.tabs.getCurrent();
+    const { reg = {} } = await chrome.storage.session.get('reg');
+    return Object.values(reg)
+      .filter(frame => frame.tabId === tab.id && frame.panelId)
+      .map(frame => ({ panelId: frame.panelId, panelEpoch: frame.panelEpoch }))
+      .sort((a, b) => a.panelId.localeCompare(b.panelId));
+  });
+
+  await retentionPage.evaluate(() => {
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    window.__restoreSendMessage = () => { chrome.runtime.sendMessage = original; };
+    chrome.runtime.sendMessage = (message, ...args) => message?.action === 'prepareFrames'
+      ? Promise.resolve({ ok: false, reason: 'Synthetic preparation failure' })
+      : original(message, ...args);
+  });
+  await retentionPage.locator('#panelCount button[data-count="6"]').click();
+  await retentionPage.waitForFunction(
+    () => document.querySelector('#status')?.textContent.includes('Synthetic preparation failure')
+  );
+  const preparationRollback = await retentionPage.evaluate(async () => {
+    const state = await chrome.storage.local.get('aib_workspace_state_layout-count-retention');
+    return {
+      panelCount: document.querySelectorAll('#grid .panel').length,
+      twoSelected: document.querySelector('#panelCount button[data-count="2"]')?.getAttribute('aria-pressed'),
+      sixSelected: document.querySelector('#panelCount button[data-count="6"]')?.getAttribute('aria-pressed'),
+      savedCount: state.aib_workspace_state_layout_count_retention?.count
+        ?? state['aib_workspace_state_layout-count-retention']?.count
+        ?? null,
+      status: document.querySelector('#status')?.textContent || ''
+    };
+  });
+  await retentionPage.evaluate(() => window.__restoreSendMessage?.());
+  preparationRollback.passed = preparationRollback.panelCount === 2
+    && preparationRollback.twoSelected === 'true'
+    && preparationRollback.sixSelected === 'false'
+    && preparationRollback.savedCount === 2
+    && preparationRollback.status.includes('Synthetic preparation failure');
+  await retentionPage.close();
+
+  const shaderPage = await context.newPage();
+  shaderPage.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(`shader-idle: ${message.text()}`);
+  });
+  shaderPage.on('pageerror', error => consoleErrors.push(`shader-idle: ${String(error)}`));
+  await instrumentShaderDraws(shaderPage);
+  await shaderPage.setViewportSize({ width: 1200, height: 800 });
+  await shaderPage.goto(`chrome-extension://${extensionId}/workspace.html?id=layout-shader-idle&count=2`);
+  await shaderPage.waitForFunction(() => window.__shaderDraws > 0);
+  await shaderPage.locator('#composer').hover();
+  await shaderPage.waitForTimeout(1400);
+  const hoverSettled = await shaderPage.evaluate(() => window.__shaderDraws);
+  await shaderPage.waitForTimeout(500);
+  const hoverIdle = await shaderPage.evaluate(() => window.__shaderDraws);
+  await shaderPage.locator('#composer').evaluate(element => element.classList.add('is-broadcasting'));
+  await shaderPage.waitForTimeout(350);
+  const broadcastingStart = await shaderPage.evaluate(() => window.__shaderDraws);
+  await shaderPage.waitForTimeout(350);
+  const broadcastingEnd = await shaderPage.evaluate(() => window.__shaderDraws);
+  await shaderPage.locator('#composer').evaluate(element => element.classList.remove('is-broadcasting'));
+  await shaderPage.waitForTimeout(1500);
+  const postBroadcastSettled = await shaderPage.evaluate(() => window.__shaderDraws);
+  await shaderPage.waitForTimeout(500);
+  const postBroadcastIdle = await shaderPage.evaluate(() => window.__shaderDraws);
+  const shaderIdle = {
+    hoverSettled,
+    hoverIdle,
+    broadcastingStart,
+    broadcastingEnd,
+    postBroadcastSettled,
+    postBroadcastIdle,
+    passed: hoverIdle === hoverSettled
+      && broadcastingEnd > broadcastingStart + 2
+      && postBroadcastIdle === postBroadcastSettled
+  };
+  await shaderPage.close();
+
+  const reducedShaderPage = await context.newPage();
+  reducedShaderPage.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(`shader-reduced-motion: ${message.text()}`);
+  });
+  reducedShaderPage.on('pageerror', error => consoleErrors.push(`shader-reduced-motion: ${String(error)}`));
+  await reducedShaderPage.emulateMedia({ reducedMotion: 'reduce' });
+  await instrumentShaderDraws(reducedShaderPage);
+  await reducedShaderPage.setViewportSize({ width: 1200, height: 800 });
+  await reducedShaderPage.goto(`chrome-extension://${extensionId}/workspace.html?id=layout-shader-reduced&count=2`);
+  await reducedShaderPage.waitForFunction(() => window.__shaderDraws > 0);
+  await reducedShaderPage.locator('#composer').hover();
+  await reducedShaderPage.waitForTimeout(120);
+  const reducedHoverDraws = await reducedShaderPage.evaluate(() => window.__shaderDraws);
+  await reducedShaderPage.waitForTimeout(450);
+  const reducedHoverIdle = await reducedShaderPage.evaluate(() => window.__shaderDraws);
+  await reducedShaderPage.locator('#composer').evaluate(element => element.classList.add('is-broadcasting'));
+  await reducedShaderPage.waitForTimeout(120);
+  const reducedBroadcastDraws = await reducedShaderPage.evaluate(() => window.__shaderDraws);
+  await reducedShaderPage.waitForTimeout(450);
+  const reducedBroadcastIdle = await reducedShaderPage.evaluate(() => window.__shaderDraws);
+  const reducedShader = {
+    mediaMatches: await reducedShaderPage.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches),
+    reducedHoverDraws,
+    reducedHoverIdle,
+    reducedBroadcastDraws,
+    reducedBroadcastIdle,
+    passed: await reducedShaderPage.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)
+      && reducedHoverIdle === reducedHoverDraws
+      && reducedBroadcastDraws > reducedHoverDraws
+      && reducedBroadcastIdle === reducedBroadcastDraws
+  };
+  await reducedShaderPage.close();
+
+  const countRetention = {
+    grownRetention,
+    shrunkRetention,
+    registryAfterShrink,
+    passed: [...grownRetention, ...shrunkRetention].every(panel =>
+      panel.sameNode && panel.reloads === 0 && panel.sameEpoch)
+      && registryAfterShrink.length === 2
+      && registryAfterShrink.every((frame, id) => frame.panelId.endsWith(`:${id}`))
   };
   const passed = results.every(result => Object.values(result.checks).every(Boolean))
     && splitPersistence.passed
+    && splitKeyboard.passed
+    && warpPicker.passed
+    && focusMode.passed
     && soloPanel.passed
+    && countRetention.passed
+    && preparationRollback.passed
+    && shaderIdle.passed
+    && reducedShader.passed
     && consoleErrors.length === 0;
 
-  console.log(JSON.stringify({ passed, extensionId, results, splitPersistence, soloPanel, consoleErrors, runDir }, null, 2));
+  console.log(JSON.stringify({
+    passed,
+    extensionId,
+    results,
+    splitPersistence,
+    splitKeyboard,
+    warpPicker,
+    focusMode,
+    soloPanel,
+    countRetention,
+    preparationRollback,
+    shaderIdle,
+    reducedShader,
+    consoleErrors,
+    runDir
+  }, null, 2));
   if (!passed) process.exitCode = 1;
 } finally {
   await context.close();

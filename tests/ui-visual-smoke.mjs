@@ -168,11 +168,18 @@ async function readyWorkspace(page, count, preview = 'verified') {
   await page.waitForFunction(expected => document.querySelectorAll('#grid .panel').length === expected, count);
   await page.waitForFunction(() => document.querySelector('#grid')?.getBoundingClientRect().height > 100);
   await page.evaluate(() => {
-    for (const frame of document.querySelectorAll('#grid iframe')) {
-      globalThis.__aibPreview.dispatch({ action: 'panelAlive', host: new URL(frame.src).hostname });
+    for (const panel of document.querySelectorAll('#grid .panel')) {
+      const frame = panel.querySelector('iframe');
+      const message = {
+        host: new URL(frame.src).hostname,
+        panelId: panel.dataset.panelId,
+        panelEpoch: Number(panel.dataset.panelEpoch)
+      };
+      globalThis.__aibPreview.dispatch({ action: 'panelAlive', ...message });
+      globalThis.__aibPreview.dispatch({ action: 'panelReadiness', state: 'ready', ...message });
     }
   });
-  await page.waitForTimeout(100);
+  await page.waitForTimeout(550);
 }
 
 async function workspaceGeometry(page) {
@@ -255,6 +262,162 @@ try {
     await page.close();
   }
 
+  const readinessPage = await context.newPage();
+  observeErrors(readinessPage, 'semantic-readiness');
+  await installChromeMocks(readinessPage);
+  await readinessPage.setViewportSize({ width: 1366, height: 768 });
+  await readyWorkspace(readinessPage, 4);
+  const semanticReadiness = await readinessPage.evaluate(() => {
+    const panels = [...document.querySelectorAll('#grid .panel')];
+    const messageFor = panel => ({
+      host: new URL(panel.querySelector('iframe').src).hostname,
+      panelId: panel.dataset.panelId,
+      panelEpoch: Number(panel.dataset.panelEpoch)
+    });
+    const first = messageFor(panels[0]);
+    const second = messageFor(panels[1]);
+    globalThis.__aibPreview.dispatch({
+      action: 'panelReadiness',
+      state: 'login_required',
+      reason: 'Sign in required',
+      ...first
+    });
+    globalThis.__aibPreview.dispatch({
+      action: 'panelReadiness',
+      state: 'not_ready',
+      reason: 'Provider security verification is blocking the composer',
+      ...second
+    });
+    // Unbound and stale reports must not make an unavailable panel look ready.
+    globalThis.__aibPreview.dispatch({ action: 'panelReadiness', state: 'ready', host: first.host });
+    globalThis.__aibPreview.dispatch({ action: 'panelReadiness', state: 'ready', ...first, panelEpoch: first.panelEpoch - 1 });
+    return {
+      states: panels.map(panel => panel.dataset.deliveryState),
+      details: panels.map(panel => panel.querySelector('.panel-state-detail')?.textContent?.trim() || ''),
+      aggregateState: document.querySelector('#readiness')?.dataset.state,
+      aggregateLabel: document.querySelector('#readinessLabel')?.textContent?.trim() || ''
+    };
+  });
+  if (semanticReadiness.states.join(',') !== 'login_required,not_ready,ready,ready'
+    || semanticReadiness.aggregateState !== 'attention'
+    || semanticReadiness.aggregateLabel !== '2/4 READY · 2 CHECK'
+    || semanticReadiness.details[0] !== 'Sign in required'
+    || !semanticReadiness.details[1].includes('security verification')) {
+    throw new Error(`semantic-readiness: ${JSON.stringify(semanticReadiness)}`);
+  }
+  const readinessScreenshotPath = path.join(outputPath, 'state-readiness-attention.png');
+  await readinessPage.screenshot({ path: readinessScreenshotPath });
+  results.push({ name: 'state-readiness-attention', screenshotPath: readinessScreenshotPath, semanticReadiness });
+  await readinessPage.close();
+
+  const reducedMotionPage = await context.newPage();
+  observeErrors(reducedMotionPage, 'reduced-motion');
+  await reducedMotionPage.emulateMedia({ reducedMotion: 'reduce' });
+  await installChromeMocks(reducedMotionPage);
+  await reducedMotionPage.setViewportSize({ width: 1366, height: 768 });
+  await readyWorkspace(reducedMotionPage, 4);
+  const reducedMotion = await reducedMotionPage.evaluate(() => ({
+    mediaMatches: matchMedia('(prefers-reduced-motion: reduce)').matches,
+    animations: document.getAnimations().map(animation => {
+      const timing = animation.effect?.getComputedTiming?.() || {};
+      return { duration: Number(timing.duration) || 0, iterations: Number(timing.iterations) || 0 };
+    })
+  }));
+  if (!reducedMotion.mediaMatches
+    || reducedMotion.animations.some(animation => animation.duration > 1 || animation.iterations > 1)) {
+    throw new Error(`reduced-motion: ${JSON.stringify(reducedMotion)}`);
+  }
+  const reducedMotionScreenshotPath = path.join(outputPath, 'reduced-motion.png');
+  await reducedMotionPage.screenshot({ path: reducedMotionScreenshotPath });
+  results.push({ name: 'reduced-motion', screenshotPath: reducedMotionScreenshotPath, reducedMotion });
+  await reducedMotionPage.close();
+
+  const reducedPopupPage = await context.newPage();
+  observeErrors(reducedPopupPage, 'popup-reduced-motion');
+  await reducedPopupPage.emulateMedia({ reducedMotion: 'reduce' });
+  await installChromeMocks(reducedPopupPage);
+  await reducedPopupPage.setViewportSize({ width: 380, height: 620 });
+  await reducedPopupPage.goto(pathToFileURL(path.join(extensionPath, 'popup.html')).href);
+  await reducedPopupPage.waitForSelector('#voiceBtn');
+  const reducedPopupMotion = await reducedPopupPage.evaluate(() => {
+    document.querySelector('#voiceBtn')?.classList.add('listening');
+    return new Promise(resolve => requestAnimationFrame(() => resolve({
+      animations: document.getAnimations().map(animation => {
+        const timing = animation.effect?.getComputedTiming?.() || {};
+        return { duration: Number(timing.duration) || 0, iterations: Number(timing.iterations) || 0 };
+      })
+    })));
+  });
+  if (reducedPopupMotion.animations.some(animation => animation.duration > 1 || animation.iterations > 1)) {
+    throw new Error(`popup-reduced-motion: ${JSON.stringify(reducedPopupMotion)}`);
+  }
+  results.push({ name: 'popup-reduced-motion', reducedPopupMotion });
+  await reducedPopupPage.close();
+
+  const mixedWorkspacePage = await context.newPage();
+  observeErrors(mixedWorkspacePage, 'workspace-mixed-attachment-rejection');
+  await installChromeMocks(mixedWorkspacePage);
+  await mixedWorkspacePage.setViewportSize({ width: 1366, height: 768 });
+  await readyWorkspace(mixedWorkspacePage, 4);
+  await mixedWorkspacePage.locator('#composer').evaluate(composer => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['image'], 'reference.png', { type: 'image/png' }));
+    transfer.items.add(new File(['notes'], 'notes.txt', { type: 'text/plain' }));
+    composer.dispatchEvent(new DragEvent('drop', {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: transfer
+    }));
+  });
+  await mixedWorkspacePage.waitForFunction(() =>
+    document.querySelector('#status')?.textContent.includes('No files from this batch were added.'));
+  await mixedWorkspacePage.locator('#imageInput').setInputFiles([
+    { name: 'reference.png', mimeType: 'image/png', buffer: Buffer.from('image') },
+    { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('notes') }
+  ]);
+  await mixedWorkspacePage.waitForFunction(() =>
+    document.querySelector('#imageInput')?.files?.length === 0);
+  const mixedWorkspaceResult = await mixedWorkspacePage.evaluate(() => ({
+    attachments: document.querySelectorAll('#imageStrip .image-tile').length,
+    inputFiles: document.querySelector('#imageInput')?.files?.length,
+    status: document.querySelector('#status')?.textContent,
+    statusType: document.querySelector('#status')?.className
+  }));
+  if (mixedWorkspaceResult.attachments !== 0
+    || mixedWorkspaceResult.inputFiles !== 0
+    || !mixedWorkspaceResult.statusType.includes('error')) {
+    throw new Error(`workspace-mixed-attachment-rejection: ${JSON.stringify(mixedWorkspaceResult)}`);
+  }
+  results.push({ name: 'workspace-mixed-attachment-rejection', mixedWorkspaceResult });
+  await mixedWorkspacePage.close();
+
+  const mixedPopupPage = await context.newPage();
+  observeErrors(mixedPopupPage, 'popup-mixed-attachment-rejection');
+  await installChromeMocks(mixedPopupPage);
+  await mixedPopupPage.setViewportSize({ width: 380, height: 620 });
+  await mixedPopupPage.goto(pathToFileURL(path.join(extensionPath, 'popup.html')).href);
+  await mixedPopupPage.waitForSelector('#imageInput', { state: 'attached' });
+  await mixedPopupPage.locator('#imageInput').setInputFiles([
+    { name: 'reference.png', mimeType: 'image/png', buffer: Buffer.from('image') },
+    { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('notes') }
+  ]);
+  await mixedPopupPage.waitForFunction(() =>
+    document.querySelector('#status')?.textContent.includes('No files from this batch were added.')
+      && document.querySelector('#imageInput')?.files?.length === 0);
+  const mixedPopupResult = await mixedPopupPage.evaluate(() => ({
+    attachments: document.querySelectorAll('#imagePreview .image-tile').length,
+    inputFiles: document.querySelector('#imageInput')?.files?.length,
+    status: document.querySelector('#status')?.textContent,
+    statusType: document.querySelector('#status')?.className
+  }));
+  if (mixedPopupResult.attachments !== 0
+    || mixedPopupResult.inputFiles !== 0
+    || !mixedPopupResult.statusType.includes('error')) {
+    throw new Error(`popup-mixed-attachment-rejection: ${JSON.stringify(mixedPopupResult)}`);
+  }
+  results.push({ name: 'popup-mixed-attachment-rejection', mixedPopupResult });
+  await mixedPopupPage.close();
+
   const stateScenarios = ['loading', 'empty', 'attachment', 'broadcasting', 'verified', 'partial', 'unverified'];
   for (const state of stateScenarios) {
     const page = await context.newPage();
@@ -262,15 +425,30 @@ try {
     await installChromeMocks(page);
     await page.setViewportSize({ width: state === 'empty' ? 430 : 1366, height: state === 'empty' ? 900 : 768 });
     const preview = ['partial', 'unverified', 'broadcasting'].includes(state) ? state : 'verified';
-    await readyWorkspace(page, 4, preview);
+    let stateDiagnostics = null;
+    if (state === 'loading') {
+      const url = new URL(pathToFileURL(path.join(extensionPath, 'workspace.html')));
+      url.searchParams.set('id', 'preview-state-loading');
+      url.searchParams.set('count', '4');
+      await page.goto(url.href);
+      await page.waitForFunction(() => document.querySelectorAll('#grid .panel').length === 4);
+      await page.waitForFunction(() => document.querySelectorAll('#grid .panel-loading').length === 4);
+    } else {
+      await readyWorkspace(page, 4, preview);
+    }
 
     if (state === 'loading') {
-      await page.evaluate(() => document.querySelectorAll('.panel').forEach(panel => {
-        const loading = document.createElement('div');
-        loading.className = 'panel-loading';
-        loading.innerHTML = '<div class="pl-spin"></div><div class="pl-text">Loading provider...</div>';
-        panel.append(loading);
+      stateDiagnostics = await page.evaluate(() => ({
+        aggregateState: document.querySelector('#readiness')?.dataset.state,
+        aggregateLabel: document.querySelector('#readinessLabel')?.textContent,
+        panelStates: [...document.querySelectorAll('.panel-live-state')].map(element => element.textContent),
+        loadingPanels: document.querySelectorAll('#grid .panel-loading').length
       }));
+      if (stateDiagnostics.aggregateState !== 'busy'
+        || stateDiagnostics.loadingPanels !== 4
+        || stateDiagnostics.panelStates.some(panelState => panelState !== 'CHECKING')) {
+        throw new Error(`state-loading: ${JSON.stringify(stateDiagnostics)}`);
+      }
     } else if (state === 'empty') {
       await page.locator('#sendBtn').click();
       await page.waitForFunction(() => document.querySelector('#status')?.textContent.includes('Enter a prompt'));
@@ -297,7 +475,7 @@ try {
 
     const screenshotPath = path.join(outputPath, `state-${state}.png`);
     await page.screenshot({ path: screenshotPath });
-    results.push({ name: `state-${state}`, screenshotPath });
+    results.push({ name: `state-${state}`, screenshotPath, ...(stateDiagnostics ? { stateDiagnostics } : {}) });
     await page.close();
   }
 
@@ -310,6 +488,16 @@ try {
     if (state === 'error') url.searchParams.set('preview', 'unverified');
     await page.goto(url.href);
     await page.waitForSelector('#prompt');
+    const statusSemantics = await page.locator('#status').evaluate(element => ({
+      role: element.getAttribute('role'),
+      live: element.getAttribute('aria-live'),
+      atomic: element.getAttribute('aria-atomic')
+    }));
+    if (statusSemantics.role !== 'status'
+      || statusSemantics.live !== 'polite'
+      || statusSemantics.atomic !== 'true') {
+      throw new Error(`popup-${state}-status-semantics: ${JSON.stringify(statusSemantics)}`);
+    }
     if (state === 'attachment') {
       await page.locator('#imageInput').setInputFiles({
         name: 'reference.pdf',
@@ -320,7 +508,14 @@ try {
     } else if (state === 'success' || state === 'error') {
       await page.locator('#prompt').fill('Summarize this request.');
       await page.locator('#broadcastBtn').click();
-      await page.waitForFunction(() => !document.querySelector('#broadcastBtn').disabled);
+      if (state === 'error') {
+        await page.waitForFunction(() => {
+          const button = document.querySelector('#broadcastBtn');
+          return button?.disabled && button.textContent.includes('Edit Draft');
+        });
+      } else {
+        await page.waitForFunction(() => !document.querySelector('#broadcastBtn').disabled);
+      }
     }
     const bodyWidth = await page.evaluate(() => document.documentElement.scrollWidth);
     if (bodyWidth > 380) throw new Error(`popup-${state}: horizontal overflow`);

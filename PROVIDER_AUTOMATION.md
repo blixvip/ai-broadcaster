@@ -3,7 +3,9 @@
 This document describes the executable provider architecture. The source of truth is:
 
 - `providers.js` — provider identity, URL, hostnames, defaults, and timeout tier.
-- `content.js` — input, submit, stop, response, and attachment selectors.
+- `content.js` — input, submit, stop, response, attachment, and readiness selectors.
+- `prompt-policy.js` — provider-specific response-language policy.
+- `delivery-protocol.js` — delivery evidence, retry safety, and attachment/fanout bounds.
 - `manifest.json` — host access and content-script matches.
 - `rules/ai_frame_rules.json` — static iframe response-header rules.
 - `background.js` — dynamic frame rules, direct-frame registration, and broadcast routing.
@@ -28,7 +30,7 @@ Image broadcasts extend the submit-control timeout and have a separate preview/u
 
 | Provider | Primary URL | Registered hosts | Tier |
 | --- | --- | --- | :---: |
-| Gemini | `https://gemini.google.com/app` | `gemini.google.com` | A |
+| Gemini | `https://gemini.google.com/app?hl=en` | `gemini.google.com` | A |
 | DeepSeek | `https://chat.deepseek.com/` | `chat.deepseek.com` | A |
 | Le Chat | `https://chat.mistral.ai/` | `chat.mistral.ai` | B |
 | Grok | `https://x.com/i/grok` | `x.com`, `www.x.com`, `twitter.com`, `www.twitter.com`, `grok.com` | B |
@@ -39,12 +41,19 @@ Image broadcasts extend the submit-control timeout and have a separate preview/u
 | Poe | `https://poe.com/` | `poe.com` | B |
 | Venice | `https://venice.ai/chat/agent` | `venice.ai`, `www.venice.ai`, `chat.venice.ai` | B |
 | Arena | `https://arena.ai/` | `arena.ai`, `lmarena.ai` | B |
-| Google AI Studio | `https://aistudio.google.com/prompts/new_chat` | `aistudio.google.com` | B |
+| Google AI Studio | `https://aistudio.google.com/prompts/new_chat?hl=en` | `aistudio.google.com` | B |
 | Microsoft Copilot | `https://copilot.microsoft.com/` | `copilot.microsoft.com` | C |
 | Qwen | `https://chat.qwen.ai/` | `chat.qwen.ai`, `chat.qwenlm.ai` | C |
 | Meta AI | `https://www.meta.ai/` | `meta.ai`, `www.meta.ai` | C |
 | Kimi | `https://www.kimi.com/` | `www.kimi.com`, `kimi.com`, `kimi.ai`, `www.kimi.ai`, `kimi.moonshot.cn` | C |
 | Blackbox AI | `https://app.blackbox.ai/chat` | `app.blackbox.ai`, `www.blackbox.ai`, `blackbox.ai` | C |
+
+DeepSeek broadcasts append an English response-language requirement. It prevents
+source material, prior turns, or locale inference from switching replies to Chinese,
+while still allowing Chinese when the user's current request explicitly asks for it.
+Gemini and AI Studio URLs explicitly request English UI (`hl=en`), and extension-owned
+surfaces declare US English. Third-party site chrome can still follow a signed-in
+account preference or provider experiment; the extension cannot override that safely.
 
 ChatGPT and Claude are not registered providers in the current extension.
 
@@ -58,6 +67,23 @@ ChatGPT and Claude are not registered providers in the current extension.
 4. `chrome.webNavigation.getFrame()` confirms that the provider is a direct child of the workspace (`parentFrameId === 0`).
 
 Nested provider frames and normal top-level provider tabs are not broadcast targets.
+
+Changing the workspace from 2–6 panels retains every unchanged iframe node in place.
+Only removed slots are retired and newly added slots are mounted, so resizing the grid
+cannot erase conversations or reset a retained panel's binding epoch.
+
+## Passive panel readiness
+
+Content-script registration proves only that a frame is connected. It does not make the
+panel `READY`. After each bound navigation, `content.js` passively searches for a usable
+composer for up to 20 seconds without focusing, clicking, or changing the draft. A READY
+panel is rechecked every 5 seconds without UI flicker; a vanished composer returns it to
+CHECKING on the next recheck, so SPA logout or navigation cannot leave stale readiness. It reports
+`ready`, `login_required`, or `not_ready`; blocked-request, security-verification, and regional
+unavailability pages include a visible reason. Failed probes retry after 30 seconds so a
+provider can recover without reloading the workspace. The workspace accepts semantic
+readiness only for the exact bound panel ID and epoch; host-only or stale reports cannot mark
+a same-provider panel ready.
 
 ## Composer discovery
 
@@ -97,7 +123,7 @@ Before altering a draft, the injector searches for a visible provider stop-gener
 
 ## Attachments
 
-The payload supports images and PDFs. Validation runs before dispatch with limits of eight files, 20 MB per file, and 48 MB combined. Unsupported, malformed, oversized, and excessive batches are rejected locally.
+The payload supports images and PDFs. Validation runs before dispatch with limits of eight files, 20 MB per file, and 48 MB combined. Fanout is also capped at 192 MB of encoded payload across target panels to avoid concurrent message-serialization spikes. Unsupported, malformed, oversized, and excessive batches are rejected locally.
 
 Qwen uses its known hidden file input when its `accept` and `multiple` constraints match the batch; all providers retain synthetic clipboard paste as the fallback.
 
@@ -122,9 +148,8 @@ Before the action, the content script captures a provider-UI baseline. It then o
 - A new user-message wrapper containing the submitted text.
 - A new attachment-bearing user turn for file-only delivery.
 - A stop-generation control that was absent at baseline.
-- New semantic assistant-response activity.
 
-Composer clearing, attachment consumption, route changes, input replacement, and unmatched user turns remain weak evidence. Weak evidence never clears the shared workspace draft.
+Composer clearing, attachment consumption, route changes, input replacement, unmatched user turns, and unrelated assistant activity remain weak evidence. Weak evidence never clears the shared workspace draft.
 
 The workspace clears its exact text and attachment payload only when every expected panel is strongly verified. Partial, unverified, failed, and no-target deliveries retain the payload. Panel retry is offered only for failures known to occur before a submit action; evidence timeouts are intentionally not auto-retryable because the provider may already have accepted the message.
 

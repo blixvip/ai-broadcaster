@@ -170,7 +170,7 @@
         "https://lmarena.ai/*",
         "https://aistudio.google.com/*"
       ],
-      "js": ["delivery-protocol.js", "providers.js", "content.js"],
+      "js": ["delivery-protocol.js", "providers.js", "prompt-policy.js", "content.js"],
       "all_frames": true,
       "run_at": "document_idle"
     },

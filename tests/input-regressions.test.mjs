@@ -6,7 +6,15 @@ import vm from 'node:vm';
 const content = fs.readFileSync(new URL('../content.js', import.meta.url), 'utf8');
 const workspace = fs.readFileSync(new URL('../workspace.js', import.meta.url), 'utf8');
 const providerSource = fs.readFileSync(new URL('../providers.js', import.meta.url), 'utf8');
+const promptPolicySource = fs.readFileSync(new URL('../prompt-policy.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+
+function loadPromptPolicy() {
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(promptPolicySource, sandbox, { filename: 'prompt-policy.js' });
+  return sandbox.AIBPromptPolicy;
+}
 
 function platformBlock(host) {
   const escaped = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -39,6 +47,28 @@ test('pre-click activation reuses ranked safe input selection', () => {
   const helper = content.match(/async function preClickActivate\(config\) \{([\s\S]*?)\n\}/)?.[1] || '';
   assert.match(helper, /findBestInput/);
   assert.doesNotMatch(helper, /queryAllDeep/);
+});
+
+test('DeepSeek receives a persistent English response-language requirement', () => {
+  const policy = loadPromptPolicy();
+  const original = 'Compare the strongest options.';
+  const transformed = policy.applyProviderPromptPolicy('chat.deepseek.com', original);
+
+  assert.ok(transformed.startsWith(original));
+  assert.match(transformed, /Reply in English/);
+  assert.match(transformed, /unless this request explicitly asks for Chinese output/);
+  assert.equal(
+    policy.applyProviderPromptPolicy('chat.deepseek.com', transformed),
+    transformed,
+    'retries must not duplicate the language requirement'
+  );
+});
+
+test('DeepSeek image-only prompts still request English and other providers are unchanged', () => {
+  const policy = loadPromptPolicy();
+
+  assert.match(policy.applyProviderPromptPolicy('chat.deepseek.com', ''), /Reply in English/);
+  assert.equal(policy.applyProviderPromptPolicy('gemini.google.com', '  Keep spacing  '), '  Keep spacing  ');
 });
 
 test('workspace panel selection persists per workspace instance', () => {

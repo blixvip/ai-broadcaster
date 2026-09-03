@@ -15,7 +15,7 @@ const PROVIDERS = globalThis.AIB_PROVIDERS || [];
 const DEFAULT_PANEL_URLS = globalThis.AIB_DEFAULT_PANEL_URLS || [];
 const PANEL_COUNTS = [2, 3, 4, 5, 6];
 const DEFAULT_COUNT = 4;
-const EMBED_TIMEOUT_MS = 20000;   // slow provider SPAs may need extra time in a fresh workspace
+const EMBED_TIMEOUT_MS = 26000;   // includes passive composer discovery on slow provider SPAs
 const WORKSPACE_PARAMS = new URLSearchParams(location.search);
 const WORKSPACE_INSTANCE_ID = WORKSPACE_PARAMS.get('id') || (() => {
   const id = typeof globalThis.crypto?.randomUUID === 'function'
@@ -30,8 +30,8 @@ const WORKSPACE_TITLE_KEY = `aib_workspace_title_${WORKSPACE_INSTANCE_ID}`;
 const WORKSPACE_LAYOUT_KEY = `aib_workspace_layout_${WORKSPACE_INSTANCE_ID}`;
 const WORKSPACE_STATE_KEY = `aib_workspace_state_${WORKSPACE_INSTANCE_ID}`;
 
-// Each panel registers a readiness monitor. background.js forwards trusted
-// content-script `panelAlive` messages to the owning workspace tab.
+// Each panel registers a connectivity/readiness monitor. background.js forwards
+// trusted content-script `panelAlive` and semantic `panelReadiness` messages.
 let panelMonitors = [];
 
 // Providers that land on a usable chat without a signup/landing wall.
@@ -45,7 +45,6 @@ const el = {
   splitNode:  document.getElementById('splitNode'),
   dashboard:  document.getElementById('dashboardBtn'),
   focusMode:  document.getElementById('focusModeBtn'),
-  panelReadout: document.getElementById('panelReadout'),
   title:      document.getElementById('workspaceTitle'),
   newWorkspace: document.getElementById('newWorkspaceBtn'),
   panelCount: document.getElementById('panelCount'),
@@ -55,13 +54,17 @@ const el = {
   imageInput: document.getElementById('imageInput'),
   imageStrip: document.getElementById('imageStrip'),
   sendBtn:    document.getElementById('sendBtn'),
-  status:     document.getElementById('status')
+  status:     document.getElementById('status'),
+  readiness:  document.getElementById('readiness'),
+  readinessLabel: document.getElementById('readinessLabel')
 };
 
 let count = DEFAULT_COUNT;
 let selectedKeys = [];            // provider key per panel slot (index = panel id)
 let attachedImages = [];
 let nextImageId = 1;
+let pendingAttachmentLoads = 0;
+let attachmentLoadQueue = Promise.resolve();
 let workspaceTabId = null;
 let focusModeEnabled = false;
 let focusedPanelId = 0;
@@ -71,6 +74,7 @@ let splitRenderFrame = null;
 let draftRevision = 0;
 let activeDelivery = null;
 const panelControllers = new Map();
+const panelEpochCounters = new Map();
 
 function createId(prefix) {
   const value = typeof globalThis.crypto?.randomUUID === 'function'
@@ -105,8 +109,14 @@ function renderFocusMode() {
 }
 
 function writeGridSplit() {
-  el.gridShell.style.setProperty('--split-x', `${(splitX * 100).toFixed(2)}%`);
-  el.gridShell.style.setProperty('--split-y', `${(splitY * 100).toFixed(2)}%`);
+  const xPercent = splitX * 100;
+  const yPercent = splitY * 100;
+  el.gridShell.style.setProperty('--split-x', `${xPercent.toFixed(2)}%`);
+  el.gridShell.style.setProperty('--split-y', `${yPercent.toFixed(2)}%`);
+  el.splitX.setAttribute('aria-valuenow', String(Math.round(xPercent)));
+  el.splitX.setAttribute('aria-valuetext', `${Math.round(xPercent)} percent from the left`);
+  el.splitY.setAttribute('aria-valuenow', String(Math.round(yPercent)));
+  el.splitY.setAttribute('aria-valuetext', `${Math.round(yPercent)} percent from the top`);
 }
 
 function applyGridSplit() {
@@ -160,24 +170,29 @@ function makePanelButton(className, title, svg) {
 }
 
 // Ensure frame rules are active and cached anti-embed responses are removed.
+// Do not race this request: loading while cache cleanup is still running can put
+// the exact blocked response back into the new iframe.
 async function prepareFrames(origins = []) {
   try {
-    await Promise.race([
-      chrome.runtime.sendMessage({ action: 'prepareFrames', origins: [...new Set(origins)] }),
-      new Promise(resolve => setTimeout(resolve, 6000))
-    ]);
-  } catch {}
+    const response = await chrome.runtime.sendMessage({
+      action: 'prepareFrames',
+      origins: [...new Set(origins)]
+    });
+    if (response?.ok !== true) throw new Error(response?.reason || 'Panel preparation failed');
+    return true;
+  } catch (error) {
+    showStatus(error?.message || 'Panel preparation failed.', 'error');
+    return false;
+  }
 }
 
 function hostOf(url) {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
-function hostMatch(a, b) {
-  if (!a || !b) return false;
-  if (a === b) return true;
-  const reg = h => h.split('.').slice(-2).join('.');
-  return reg(a) === reg(b);
+function providerAcceptsHost(providerKey, host) {
+  const provider = providerByKey(providerKey);
+  return !!host && (provider?.domains || [provider?.domain]).includes(host);
 }
 
 function keyFromUrl(url) {
@@ -218,6 +233,24 @@ function showStatus(message, type = '') {
   el.status.textContent = message;
   el.status.title = message;
   el.status.className = `status ${type}`.trim();
+}
+
+function updateReadiness() {
+  const controllers = [...panelControllers.values()];
+  const ready = controllers.filter(controller => ['ready', 'verified'].includes(controller.state)).length;
+  const failed = controllers.filter(controller => ['failed', 'unverified', 'login_required', 'not_ready'].includes(controller.state)).length;
+  const busy = controllers.filter(controller => ['checking', 'preparing', 'injecting', 'uploading', 'verifying'].includes(controller.state)).length;
+  const total = controllers.length || count;
+  const mode = failed ? 'attention' : busy ? 'busy' : ready === total ? 'ready' : 'idle';
+  el.readiness.dataset.state = mode;
+  el.readinessLabel.textContent = failed
+    ? `${ready}/${total} READY · ${failed} CHECK`
+    : busy
+      ? `${ready}/${total} READY · ${busy} LOADING`
+      : `${ready}/${total} READY`;
+  el.readiness.title = failed
+    ? 'One or more panels need attention before a full broadcast.'
+    : `${ready} of ${total} panels are ready.`;
 }
 
 function applyWorkspaceTitle(value, syncInput = true) {
@@ -391,18 +424,24 @@ function escapeHtml(s) {
 // Modal: pick which Warp pane receives the paste. Resolves to a paneId or null.
 function pickWarpPane(panes) {
   return new Promise(resolve => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const overlay = document.createElement('div');
     overlay.className = 'warp-modal-overlay';
     const modal = document.createElement('div');
     modal.className = 'warp-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
 
     const title = document.createElement('div');
     title.className = 'warp-modal-title';
+    title.id = createId('warp-pane-title');
     title.textContent = 'Send to which Warp pane?';
+    modal.setAttribute('aria-labelledby', title.id);
 
     const list = document.createElement('div');
     list.className = 'warp-modal-list';
     const activeId = (panes.find(p => p.active) || panes[0])?.id;
+    let activeRadio = null;
     for (const p of panes) {
       const row = document.createElement('label');
       row.className = 'warp-pane-row';
@@ -410,7 +449,10 @@ function pickWarpPane(panes) {
       radio.type = 'radio';
       radio.name = 'warp-pane';
       radio.value = p.id;
-      if (p.id === activeId) radio.checked = true;
+      if (p.id === activeId) {
+        radio.checked = true;
+        activeRadio = radio;
+      }
       const text = document.createElement('span');
       text.innerHTML = `<b>${escapeHtml(p.label)}</b><br><small>${escapeHtml(p.detail || p.app)}</small>`;
       row.append(radio, text);
@@ -429,13 +471,47 @@ function pickWarpPane(panes) {
     overlay.append(modal);
     document.body.append(overlay);
 
-    const close = val => { overlay.remove(); resolve(val); };
+    let settled = false;
+    const focusable = () => [...modal.querySelectorAll('input:not([disabled]), button:not([disabled])')];
+    const close = value => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener('keydown', onKeyDown, true);
+      overlay.remove();
+      previousFocus?.focus?.();
+      resolve(value);
+    };
+    const onKeyDown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(null);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = focusable();
+      if (!controls.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
     cancel.addEventListener('click', () => close(null));
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+    overlay.addEventListener('click', event => { if (event.target === overlay) close(null); });
     send.addEventListener('click', () => {
       const chosen = modal.querySelector('input[name="warp-pane"]:checked');
       close(chosen ? chosen.value : null);
     });
+    (activeRadio || cancel).focus();
   });
 }
 
@@ -503,6 +579,7 @@ async function sendPanelToWarp(frame, labelText, choosePane = false) {
 const PANEL_STATE_LABELS = {
   idle: 'IDLE',
   ready: 'READY',
+  checking: 'CHECKING',
   preparing: 'PREPARING',
   injecting: 'INJECTING',
   uploading: 'UPLOADING',
@@ -510,6 +587,7 @@ const PANEL_STATE_LABELS = {
   verified: 'VERIFIED',
   unverified: 'CHECK',
   failed: 'ERROR',
+  login_required: 'SIGN IN',
   not_ready: 'NOT READY'
 };
 
@@ -549,7 +627,7 @@ function setPanelDeliveryState(panelId, state, details = {}) {
   controller.liveState.textContent = PANEL_STATE_LABELS[next];
   const reason = details.reason || details.title || '';
   controller.liveState.title = reason || PANEL_STATE_LABELS[next];
-  controller.stateDetail.textContent = ['failed', 'unverified', 'not_ready'].includes(next)
+  controller.stateDetail.textContent = ['failed', 'unverified', 'login_required', 'not_ready'].includes(next)
     ? deliveryReasonLabel(reason)
     : '';
   controller.stateDetail.hidden = !controller.stateDetail.textContent;
@@ -558,7 +636,36 @@ function setPanelDeliveryState(panelId, state, details = {}) {
   controller.retryButton.title = details.retry?.safe
     ? `Retry this panel: ${details.reason || 'delivery failed before submission'}`
     : 'Retry is unavailable because the previous action may already have submitted';
+  controller.panel.setAttribute('aria-busy', String(['checking', 'preparing', 'injecting', 'uploading', 'verifying'].includes(next)));
+  controller.panel.setAttribute('aria-label', `Panel ${controller.id + 1}: ${PANEL_STATE_LABELS[next].toLowerCase()}`);
   if (details.result) controller.lastResult = details.result;
+  updateReadiness();
+}
+
+function guardDeliverySensitiveChange(actionLabel) {
+  if (activeDelivery?.inFlight) {
+    showStatus(`Wait for the active delivery before ${actionLabel}.`, 'error');
+    return true;
+  }
+  if (activeDelivery && activeDelivery.draftRevision === draftRevision && !deliveryIsFullyVerified(activeDelivery)) {
+    showStatus('This draft still has unresolved panels. Use the safe retry, or edit the draft before changing the workspace.', 'error');
+    return true;
+  }
+  if (activeDelivery?.draftRevision !== draftRevision) activeDelivery = null;
+  return false;
+}
+
+function restoreUnresolvedPanelState(panelId) {
+  const result = activeDelivery?.results.get(panelId);
+  const outcome = result?.attempt?.outcome || result?.outcome;
+  if (!result || outcome === 'verified') return false;
+  setPanelDeliveryState(panelId, outcome || 'failed', {
+    panelEpoch: panelControllers.get(panelId)?.panelEpoch,
+    reason: result.attempt?.reason || result.reason,
+    retry: result.attempt?.retry || result.retry,
+    result
+  });
+  return true;
 }
 
 function buildPanel(id, key) {
@@ -607,12 +714,13 @@ function buildPanel(id, key) {
   urlInput.spellcheck = false;
   urlInput.value = provider.url;
 
-  const goBtn = makePanelButton('panel-btn', 'Open URL',
+  const goBtn = makePanelButton('panel-btn panel-go', 'Open URL',
     '<svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
-  const reloadBtn = makePanelButton('panel-btn', 'Reload panel',
+  const reloadBtn = makePanelButton('panel-btn panel-reload', 'Reload panel',
     '<svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></svg>');
   const soloBtn = makePanelButton('panel-btn panel-solo', 'Focus panel',
     '<svg viewBox="0 0 24 24"><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 0 1-1v-4"/></svg>');
+  soloBtn.setAttribute('aria-pressed', 'false');
   const warpBtn = makePanelButton('panel-btn panel-btn-warp', 'Send latest response to Warp (Shift+click to choose)',
     '<span>WARP</span><svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>');
   const retryBtn = makePanelButton('panel-btn panel-retry', 'Retry this panel',
@@ -625,13 +733,17 @@ function buildPanel(id, key) {
   const frame = document.createElement('iframe');
   frame.className = 'panel-frame';
   frame.src = provider.url;
+  frame.lang = provider.locale || 'en-US';
+  frame.title = `${provider.label} chat panel`;
   frame.setAttribute('allow', 'clipboard-write; clipboard-read; microphone; camera; autoplay');
 
   // — per-panel state —
   let loadingEl = null;
-  let aliveResolved = false;
+  let readinessResolved = false;
   let watchTimer = null;
-  let panelEpoch = 1;
+  let panelEpoch = (panelEpochCounters.get(panelId) || 0) + 1;
+  panelEpochCounters.set(panelId, panelEpoch);
+  panel.dataset.panelEpoch = String(panelEpoch);
   const bindingTimers = new Set();
   const controller = {
     id,
@@ -644,6 +756,8 @@ function buildPanel(id, key) {
     stateDetail,
     retryButton: retryBtn,
     state: 'idle',
+    readinessState: 'checking',
+    readinessReason: '',
     lastResult: null
   };
   panelControllers.set(panelId, controller);
@@ -680,10 +794,14 @@ function buildPanel(id, key) {
 
   function navigateFrame(url) {
     panelEpoch += 1;
+    panelEpochCounters.set(panelId, panelEpoch);
     controller.panelEpoch = panelEpoch;
+    panel.dataset.panelEpoch = String(panelEpoch);
     controller.providerKey = selectedKeys[id];
     controller.lastResult = null;
-    setPanelDeliveryState(panelId, 'preparing');
+    controller.readinessState = 'checking';
+    controller.readinessReason = '';
+    setPanelDeliveryState(panelId, 'checking');
     frame.src = url;
     startEmbedWatch();
   }
@@ -693,6 +811,8 @@ function buildPanel(id, key) {
     panel.dataset.provider = nextProvider.key;
     panel.style.setProperty('--panel-accent', providerAccent(nextProvider.key));
     logo.innerHTML = providerMark(nextProvider.key);
+    frame.lang = nextProvider.locale || 'en-US';
+    frame.title = `${nextProvider.label} chat panel`;
   }
 
   // Keep the provider mounted while its content script registers. A late
@@ -701,37 +821,78 @@ function buildPanel(id, key) {
     removeLoading();
     loadingEl = document.createElement('div');
     loadingEl.className = 'panel-loading';
-    loadingEl.innerHTML = `<div class="pl-spin"></div><div class="pl-text">Loading ${label()}…</div>`;
+    loadingEl.innerHTML = `
+      <div class="pl-orbit" aria-hidden="true"><span></span><i></i></div>
+      <div class="pl-text">CONNECTING TO ${escapeHtml(label().toUpperCase())}</div>
+      <div class="pl-progress" aria-hidden="true"><span></span></div>`;
     panel.append(loadingEl);
   }
   function removeLoading() { loadingEl?.remove(); loadingEl = null; }
 
   function startEmbedWatch() {
-    aliveResolved = false;
+    readinessResolved = false;
     clearTimeout(watchTimer);
     showLoading();
     watchTimer = setTimeout(() => {
-      if (aliveResolved) return;
+      if (readinessResolved) return;
       removeLoading();
-      // Never unload a provider just because its readiness ping was late. The
-      // frame stays mounted and can finish loading independently in every
-      // workspace. This also avoids turning a temporary delay into a blank slot.
-      setPanelDeliveryState(panelId, 'not_ready', { reason: 'Panel content script did not register in time' });
+      controller.readinessState = 'not_ready';
+      controller.readinessReason = 'Composer readiness could not be confirmed in time';
+      // Never unload a provider just because its readiness probe was late. The
+      // frame stays mounted and a later semantic readiness update can recover it.
+      if (activeDelivery?.inFlight) return;
+      if (!restoreUnresolvedPanelState(panelId)) {
+        setPanelDeliveryState(panelId, 'not_ready', { reason: controller.readinessReason });
+      }
     }, EMBED_TIMEOUT_MS);
   }
-  function notifyAlive(message) {
+
+  function messageMatchesPanel(message, exactBinding = false) {
     const host = message?.host || '';
-    if (message?.panelId && message.panelId !== panelId) return;
-    if (Number.isInteger(message?.panelEpoch) && message.panelEpoch !== panelEpoch) return;
-    if (!hostMatch(host, hostOf(frame.src))) return;
-    aliveResolved = true;
-    controller.frameId = Number.isInteger(message?.frameId) ? message.frameId : controller.frameId;
-    clearTimeout(watchTimer);
-    removeLoading();
-    if (!activeDelivery?.inFlight) setPanelDeliveryState(panelId, 'ready');
+    if (!providerAcceptsHost(controller.providerKey, host)) return false;
+    if (exactBinding && message?.panelId !== panelId) return false;
+    if (message?.panelId && message.panelId !== panelId) return false;
+    if (exactBinding && message?.panelEpoch !== panelEpoch) return false;
+    if (Number.isInteger(message?.panelEpoch) && message.panelEpoch !== panelEpoch) return false;
+    return true;
   }
+
+  function notifyAlive(message) {
+    if (!messageMatchesPanel(message)) return;
+    controller.frameId = Number.isInteger(message?.frameId) ? message.frameId : controller.frameId;
+    removeLoading();
+    if (activeDelivery?.inFlight) return;
+    if (!restoreUnresolvedPanelState(panelId)) setPanelDeliveryState(panelId, 'checking');
+  }
+
+  function notifyReadiness(message) {
+    // Readiness is authoritative only after the child frame accepted this panel's
+    // stable binding. Host-only announcements can belong to another same-provider panel.
+    if (!messageMatchesPanel(message, true)) return;
+    const state = ['checking', 'ready', 'login_required', 'not_ready'].includes(message?.state)
+      ? message.state
+      : 'not_ready';
+    const reason = String(message?.reason || '').slice(0, 240);
+    controller.frameId = Number.isInteger(message?.frameId) ? message.frameId : controller.frameId;
+    controller.readinessState = state;
+    controller.readinessReason = reason;
+    if (state !== 'checking') {
+      readinessResolved = true;
+      clearTimeout(watchTimer);
+    }
+    removeLoading();
+    if (activeDelivery?.inFlight) return;
+    if (restoreUnresolvedPanelState(panelId)) return;
+    setPanelDeliveryState(panelId, state, {
+      panelEpoch,
+      reason: state === 'login_required' ? (reason || 'Sign in required') : reason
+    });
+  }
+
   panelMonitors.push({
+    panelId,
     notifyAlive,
+    notifyReadiness,
     dispose() {
       clearTimeout(watchTimer);
       clearBindingTimers();
@@ -742,45 +903,45 @@ function buildPanel(id, key) {
   // A cross-origin iframe emits load on its owning element. Bind its new document
   // to this stable panel identity, then wait for content-script readiness.
   frame.addEventListener('load', () => {
-    removeLoading();
     schedulePanelBinding();
   });
 
   // — wiring —
   select.addEventListener('change', async () => {
-    if (activeDelivery?.inFlight) {
+    if (guardDeliverySensitiveChange('changing a provider')) {
       select.value = selectedKeys[id];
-      showStatus('Wait for the active delivery before changing a provider.', 'error');
       return;
     }
-    activeDelivery = null;
-    selectedKeys[id] = select.value;
-    const p2 = providerByKey(select.value);
-    saveWorkspaceState().catch(() => {});
+    const previousKey = selectedKeys[id];
+    const nextKey = select.value;
+    const p2 = providerByKey(nextKey);
+    showStatus(`Loading ${p2.label}…`);
+    if (!await prepareFrames(originsForKey(nextKey))) {
+      select.value = previousKey;
+      return;
+    }
+    selectedKeys[id] = nextKey;
     updatePanelIdentity(p2);
     urlInput.value = p2.url;
-    showStatus(`Loading ${p2.label}…`);
-    await prepareFrames(originsForKey(select.value));
+    saveWorkspaceState().catch(() => {});
     navigateFrame(p2.url);
     showStatus(`Panel ${id + 1} → ${p2.label}.`, 'success');
   });
 
   const navigate = async () => {
-    if (activeDelivery?.inFlight) {
-      showStatus('Wait for the active delivery before navigating a panel.', 'error');
-      return;
-    }
-    activeDelivery = null;
+    if (guardDeliverySensitiveChange('navigating a panel')) return;
     const url = normalizeUrl(urlInput.value);
     if (!url) return;
-    urlInput.value = url;
     const matchedKey = keyFromUrl(url);
+    const nextKey = matchedKey || selectedKeys[id];
+    if (!await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(nextKey)])) return;
+    urlInput.value = url;
     if (matchedKey) {
       selectedKeys[id] = matchedKey;
       select.value = matchedKey;
+      updatePanelIdentity(providerByKey(matchedKey));
       saveWorkspaceState().catch(() => {});
     }
-    await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(selectedKeys[id])]);
     navigateFrame(url);
   };
   goBtn.addEventListener('click', navigate);
@@ -793,9 +954,8 @@ function buildPanel(id, key) {
       showStatus('Wait for the active delivery before reloading a panel.', 'error');
       return;
     }
-    activeDelivery = null;
     showStatus(`Reloading panel ${id + 1}…`);
-    await prepareFrames([`https://${hostOf(frame.src)}`, ...originsForKey(selectedKeys[id])]);
+    if (!await prepareFrames([`https://${hostOf(frame.src)}`, ...originsForKey(selectedKeys[id])])) return;
     navigateFrame(frame.src);
     showStatus('');
   });
@@ -811,12 +971,14 @@ function buildPanel(id, key) {
     for (const other of el.grid.querySelectorAll('.panel')) other.classList.remove('is-solo');
     for (const button of el.grid.querySelectorAll('.panel-solo')) {
       button.classList.remove('active');
+      button.setAttribute('aria-pressed', 'false');
       button.title = 'Focus panel';
       button.setAttribute('aria-label', button.title);
     }
     panel.classList.toggle('is-solo', soloing);
     el.gridShell.classList.toggle('has-solo-panel', soloing);
     soloBtn.classList.toggle('active', soloing);
+    soloBtn.setAttribute('aria-pressed', String(soloing));
     soloBtn.title = soloing ? 'Restore grid' : 'Focus panel';
     soloBtn.setAttribute('aria-label', soloBtn.title);
   });
@@ -824,22 +986,55 @@ function buildPanel(id, key) {
   panel.addEventListener('pointerenter', () => {
     if (focusModeEnabled) setFocusedPanel(id);
   });
+  panel.addEventListener('focusin', () => setFocusedPanel(id));
+  frame.addEventListener('focus', () => setFocusedPanel(id));
   head.addEventListener('pointerdown', () => setFocusedPanel(id));
 
   head.append(brand, stateDetail, urlInput, panelActions);
   panel.append(head, frame);
 
-  setPanelDeliveryState(panelId, 'preparing');
+  setPanelDeliveryState(panelId, 'checking');
   startEmbedWatch();
   return panel;
 }
 
-function renderGrid() {
-  // Retired frames must not retain embed timers. Otherwise a provider switch
-  // can let the old panel's timeout fire after the new panel is already live.
-  for (const monitor of panelMonitors) monitor.dispose?.();
-  panelMonitors = [];
-  panelControllers.clear();
+function retirePanel(panelId) {
+  const controller = panelControllers.get(panelId);
+  controller?.panel.remove();
+  panelControllers.delete(panelId);
+  panelMonitors = panelMonitors.filter(monitor => {
+    if (monitor.panelId !== panelId) return true;
+    monitor.dispose?.();
+    return false;
+  });
+}
+
+async function reconcilePanelRegistry() {
+  const panels = [...panelControllers.values()].map(controller => ({
+    panelId: controller.panelId,
+    panelEpoch: controller.panelEpoch
+  }));
+  const response = await sendWorkspaceMessage({ action: 'reconcilePanels', panels }).catch(() => null);
+  if (response?.ok === true) return true;
+  showStatus(response?.reason || 'Could not synchronize panel targets. Reload before broadcasting.', 'error');
+  return false;
+}
+
+async function renderGrid() {
+  const desiredPanelIds = new Set(
+    Array.from({ length: count }, (_, id) => `${WORKSPACE_INSTANCE_ID}:${id}`)
+  );
+
+  // Keep retained iframe nodes exactly where they are. Removing/reinserting an
+  // iframe destroys its browsing context in Chrome, which would erase the chat
+  // merely because the user changed the panel count.
+  for (const [panelId, controller] of [...panelControllers]) {
+    const expectedKey = selectedKeys[controller.id];
+    const canRetain = desiredPanelIds.has(panelId)
+      && controller.providerKey === expectedKey
+      && controller.panel.parentElement === el.grid;
+    if (!canRetain) retirePanel(panelId);
+  }
 
   const isQuad = count === 4;
   el.gridShell.classList.toggle('is-resizable', isQuad);
@@ -851,19 +1046,35 @@ function renderGrid() {
     el.grid.style.removeProperty('grid-template-columns');
     el.grid.style.removeProperty('grid-template-rows');
   }
-  el.grid.innerHTML = '';
+
+  for (let id = 0; id < count; id += 1) {
+    const panelId = `${WORKSPACE_INSTANCE_ID}:${id}`;
+    if (!panelControllers.has(panelId)) el.grid.appendChild(buildPanel(id, selectedKeys[id]));
+  }
+
   el.gridShell.classList.remove('has-solo-panel');
-  selectedKeys.slice(0, count).forEach((key, id) => {
-    el.grid.appendChild(buildPanel(id, key));
-  });
-  el.panelReadout.textContent = `${String(count).padStart(2, '0')} PANELS`;
+  for (const panel of el.grid.querySelectorAll('.panel')) {
+    panel.classList.remove('is-solo');
+    const soloButton = panel.querySelector('.panel-solo');
+    soloButton?.classList.remove('active');
+    soloButton?.setAttribute('aria-pressed', 'false');
+    if (soloButton) {
+      soloButton.title = 'Focus panel';
+      soloButton.setAttribute('aria-label', soloButton.title);
+    }
+  }
   applyGridSplit();
   renderFocusMode();
+  updateReadiness();
+  return reconcilePanelRegistry();
 }
 
 function renderCountButtons() {
   for (const btn of el.panelCount.querySelectorAll('button')) {
-    btn.classList.toggle('active', Number(btn.dataset.count) === count);
+    const selected = Number(btn.dataset.count) === count;
+    btn.classList.toggle('active', selected);
+    btn.setAttribute('aria-pressed', String(selected));
+    btn.setAttribute('aria-label', `${btn.dataset.count} panels`);
   }
 }
 
@@ -882,10 +1093,25 @@ function setCount(next) {
 // background.js resets a direct panel when it attempts an external auth flow
 // that cannot complete reliably inside an embedded third-party context.
 // ---------------------------------------------------------------------------
-function resetPanelsByHost(host, url) {
-  for (const controller of panelControllers.values()) {
-    if (!hostMatch(hostOf(controller.frame.src), host)) continue;
-    controller.navigate?.(url || controller.frame.src);
+async function resetPanelFromAuth(message) {
+  const direct = message?.panelId ? panelControllers.get(message.panelId) : null;
+  if (direct && (!Number.isInteger(message.panelEpoch) || message.panelEpoch === direct.panelEpoch)) {
+    const url = message.url || direct.frame.src;
+    if (await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(direct.providerKey)])) {
+      direct.navigate?.(url);
+    }
+    return;
+  }
+
+  // Compatibility fallback for a service worker that has not yet learned the
+  // binding. Match only one provider-registry identity, never a registrable domain.
+  const candidate = [...panelControllers.values()].find(controller =>
+    controller.providerKey === message?.providerKey
+      || providerAcceptsHost(controller.providerKey, message?.host));
+  if (!candidate) return;
+  const url = message.url || candidate.frame.src;
+  if (await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(candidate.providerKey)])) {
+    candidate.navigate?.(url);
   }
 }
 
@@ -893,6 +1119,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || !msg.action) return false;
   if (msg.action === 'panelAlive') {
     for (const monitor of panelMonitors) monitor.notifyAlive(msg);
+    return false;
+  }
+  if (msg.action === 'panelReadiness') {
+    for (const monitor of panelMonitors) monitor.notifyReadiness(msg);
     return false;
   }
   if (msg.action === 'deliveryLifecycle') {
@@ -907,21 +1137,100 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
   if (msg.action === 'authResetPanel') {
-    resetPanelsByHost(msg.host, msg.url);
+    resetPanelFromAuth(msg);
     return false;
   }
   if (msg.action === 'compose-add') {
-    const added = addToComposer(msg.text, msg.images, msg.broadcast);
-    sendResponse({ added });
+    sendResponse(addToComposer(msg.text, msg.images, msg.broadcast));
     return true;
   }
   return false;
 });
 
+// Validate and start through one path so hotkey acknowledgements mean the
+// delivery was synchronously accepted, not merely that a submit was requested.
+function validateComposerSubmission() {
+  if (el.sendBtn.disabled || activeDelivery?.inFlight) {
+    return {
+      ok: false,
+      reason: 'delivery_in_progress',
+      message: 'Wait for the active delivery before sending again.'
+    };
+  }
+  if (pendingAttachmentLoads) {
+    return {
+      ok: false,
+      reason: 'attachment_loading',
+      message: 'Wait for attachments to finish loading before sending.'
+    };
+  }
+  if (activeDelivery && activeDelivery.draftRevision === draftRevision) {
+    return {
+      ok: false,
+      reason: 'unresolved_delivery',
+      message: 'This preserved draft already has unresolved panels. Use a safe panel retry or edit the draft to start a new delivery.'
+    };
+  }
+
+  const promptSnapshot = el.prompt.value;
+  const text = promptSnapshot.trim();
+  const imageIds = attachedImages.map(image => image.id);
+  const images = broadcastImages();
+  if (!text && !images.length) {
+    return { ok: false, reason: 'empty_draft', message: 'Enter a prompt or attach a file first.' };
+  }
+
+  const fanoutValidation = DELIVERY.validateAttachmentFanout(images, panelControllers.size);
+  if (!fanoutValidation.ok) {
+    return {
+      ok: false,
+      reason: fanoutValidation.reason,
+      message: attachmentErrorMessage(fanoutValidation.reason)
+    };
+  }
+
+  return { ok: true, text, images, promptSnapshot, imageIds };
+}
+
+function beginComposerDelivery() {
+  const candidate = validateComposerSubmission();
+  if (!candidate.ok) {
+    showStatus(candidate.message, 'error');
+    return { accepted: false, reason: candidate.reason, message: candidate.message };
+  }
+
+  const { delivery, controllers } = createDelivery(
+    candidate.text,
+    candidate.images,
+    candidate.promptSnapshot,
+    candidate.imageIds
+  );
+  activeDelivery = delivery;
+  el.sendBtn.disabled = true;
+  el.composer.classList.add('is-broadcasting');
+  showStatus('Preparing verified delivery…');
+
+  void (async () => {
+    try {
+      await dispatchDelivery(delivery, controllers);
+    } catch (error) {
+      delivery.inFlight = false;
+      showStatus(error?.message ? `Error: ${error.message}` : 'Broadcast failed. Your draft was preserved.', 'error');
+    } finally {
+      el.sendBtn.disabled = false;
+      el.composer.classList.remove('is-broadcasting');
+      el.prompt.focus();
+    }
+  })();
+
+  return { accepted: true, reason: '', message: '' };
+}
+
 // Fill the composer from the grab hotkey (background handleGrabCommand).
 // broadcast=false → just fill the box; broadcast=true → fill AND send now.
 function addToComposer(text, images, broadcast = false) {
   let added = false;
+  let rejectionReason = '';
 
   const trimmed = (text || '').trim();
   if (trimmed) {
@@ -945,7 +1254,8 @@ function addToComposer(text, images, broadcast = false) {
   if (incomingAttachments.length) {
     const validation = DELIVERY.validateAttachments([...attachedImages, ...incomingAttachments]);
     if (!validation.ok) {
-      showStatus(attachmentErrorMessage(validation.reason), 'error');
+      rejectionReason = attachmentErrorMessage(validation.reason);
+      showStatus(rejectionReason, 'error');
     } else {
       attachedImages.push(...incomingAttachments);
       renderImages();
@@ -953,17 +1263,28 @@ function addToComposer(text, images, broadcast = false) {
     }
   }
 
-  if (!added) return false;
+  if (!added) {
+    return { added: false, broadcasted: false, reason: rejectionReason || 'Nothing usable was added.' };
+  }
   markDraftChanged();
 
   if (broadcast) {
-    showStatus('Broadcasting pasted content…');
-    el.composer.requestSubmit();   // runs the normal submit → broadcast + clear
-  } else {
+    const submission = beginComposerDelivery();
+    if (submission.accepted) {
+      return { added: true, broadcasted: true, reason: '', message: '' };
+    }
     el.prompt.focus();
-    showStatus('Pasted — press SEND to broadcast.', 'success');
+    return {
+      added: true,
+      broadcasted: false,
+      reason: submission.reason,
+      message: submission.message
+    };
   }
-  return true;
+
+  el.prompt.focus();
+  showStatus('Pasted — press SEND to broadcast.', 'success');
+  return { added: true, broadcasted: false, reason: '', message: '' };
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1295,7 @@ function attachmentErrorMessage(reason) {
     too_many_attachments: `Attach no more than ${ATTACHMENT_LIMITS.maxCount} files.`,
     attachment_too_large: 'Each attachment must be 20 MB or smaller.',
     attachment_batch_too_large: 'The combined attachment payload must be 48 MB or smaller.',
+    attachment_fanout_too_large: 'This attachment set is too large to send safely to every panel. Remove or compress one or more files.',
     unsupported_attachment_type: 'Only images and PDF files are supported.',
     invalid_attachment_data: 'One attachment could not be read safely.'
   }[reason] || 'Could not attach that file.';
@@ -1002,33 +1324,17 @@ function attachmentFilesFromList(files) {
 function renderImages() {
   el.imageStrip.innerHTML = '';
   for (const image of attachedImages) {
-    const tile = document.createElement('div');
-    tile.className = `image-tile${image.type === 'application/pdf' ? ' is-pdf' : ''}`;
-    if (image.type === 'application/pdf') {
-      const badge = document.createElement('span');
-      badge.className = 'file-badge';
-      badge.textContent = 'PDF';
-      badge.title = image.name;
-      tile.append(badge);
-    } else {
-      const img = document.createElement('img');
-      img.src = image.base64;
-      img.alt = image.name;
-      tile.append(img);
-    }
-    const remove = document.createElement('button');
-    remove.className = 'remove-btn'; remove.type = 'button';
-    remove.textContent = '×'; remove.dataset.imageId = String(image.id);
-    remove.title = `Remove ${image.name}`;
-    tile.append(remove);
-    el.imageStrip.append(tile);
+    el.imageStrip.append(globalThis.AIBAttachmentUI.createChip(image));
   }
+  el.composer.classList.toggle('has-attachments', attachedImages.length > 0);
 }
 
 async function loadImageFiles(files) {
-  const candidates = attachmentFilesFromList(files);
-  if (!candidates.length) {
-    if (Array.from(files || []).length) showStatus('Only images and PDF files are supported.', 'error');
+  const sourceFiles = Array.from(files || []);
+  if (!sourceFiles.length) return;
+  const candidates = attachmentFilesFromList(sourceFiles);
+  if (candidates.length !== sourceFiles.length) {
+    showStatus('Only images and PDF files are supported. No files from this batch were added.', 'error');
     return;
   }
 
@@ -1048,6 +1354,7 @@ async function loadImageFiles(files) {
     return;
   }
 
+  showStatus(`Loading ${candidates.length} attachment${candidates.length === 1 ? '' : 's'}…`);
   const attachments = await Promise.all(candidates.map(readAttachmentFile));
   const validation = DELIVERY.validateAttachments([...attachedImages, ...attachments]);
   if (!validation.ok) {
@@ -1058,6 +1365,23 @@ async function loadImageFiles(files) {
   markDraftChanged();
   el.imageInput.value = '';
   renderImages();
+  const totalBytes = attachedImages.reduce((sum, image) => sum + (image.size || 0), 0);
+  showStatus(`${attachedImages.length} attachment${attachedImages.length === 1 ? '' : 's'} ready · ${globalThis.AIBAttachmentUI.formatBytes(totalBytes)}.`, 'success');
+}
+
+function enqueueAttachmentFiles(files) {
+  const snapshot = Array.from(files || []);
+  pendingAttachmentLoads += 1;
+  el.composer.setAttribute('aria-busy', 'true');
+  const task = attachmentLoadQueue.then(() => loadImageFiles(snapshot));
+  attachmentLoadQueue = task.catch(() => {});
+  return task.finally(() => {
+    pendingAttachmentLoads = Math.max(0, pendingAttachmentLoads - 1);
+    if (!pendingAttachmentLoads) {
+      el.composer.removeAttribute('aria-busy');
+      el.imageInput.value = '';
+    }
+  });
 }
 
 function broadcastImages() {
@@ -1149,17 +1473,21 @@ async function dispatchDelivery(delivery, controllers) {
   }
 
   delivery.inFlight = true;
-  const response = await sendWorkspaceMessage({
-    action: 'execute',
-    deliveryId: delivery.deliveryId,
-    panelAttempts,
-    text: delivery.text,
-    images: delivery.images,
-    imageBase64: delivery.images[0]?.base64 || null,
-    imageName: delivery.images[0]?.name || null,
-    imageType: delivery.images[0]?.type || null
-  });
-  delivery.inFlight = false;
+  let response;
+  try {
+    response = await sendWorkspaceMessage({
+      action: 'execute',
+      deliveryId: delivery.deliveryId,
+      panelAttempts,
+      text: delivery.text,
+      images: delivery.images,
+      imageBase64: delivery.images[0]?.base64 || null,
+      imageName: delivery.images[0]?.name || null,
+      imageType: delivery.images[0]?.type || null
+    });
+  } finally {
+    delivery.inFlight = false;
+  }
 
   applyPanelResults(delivery, response?.panelResults || response?.results || []);
   showDeliverySummary(delivery);
@@ -1275,9 +1603,30 @@ function startSplitDrag(axis, event) {
   handle.addEventListener('pointercancel', end);
 }
 
+function adjustSplitFromKeyboard(axis, event) {
+  if (count !== 4) return;
+  const direction = axis === 'x'
+    ? { ArrowLeft: -1, ArrowRight: 1 }
+    : { ArrowUp: -1, ArrowDown: 1 };
+  let next = axis === 'x' ? splitX : splitY;
+  if (event.key === 'Home') next = 0.28;
+  else if (event.key === 'End') next = 0.72;
+  else if (direction[event.key]) next += direction[event.key] * (event.shiftKey ? 0.05 : 0.02);
+  else return;
+
+  event.preventDefault();
+  next = Math.min(0.72, Math.max(0.28, next));
+  if (axis === 'x') splitX = next;
+  else splitY = next;
+  flushGridSplit();
+  saveWorkspaceLayout().catch(() => {});
+}
+
 el.splitX.addEventListener('pointerdown', event => startSplitDrag('x', event));
 el.splitY.addEventListener('pointerdown', event => startSplitDrag('y', event));
 el.splitNode.addEventListener('pointerdown', event => startSplitDrag('both', event));
+el.splitX.addEventListener('keydown', event => adjustSplitFromKeyboard('x', event));
+el.splitY.addEventListener('keydown', event => adjustSplitFromKeyboard('y', event));
 el.splitNode.addEventListener('dblclick', () => {
   splitX = 0.5;
   splitY = 0.5;
@@ -1318,27 +1667,54 @@ el.panelCount.addEventListener('click', async event => {
   if (!btn) return;
   const next = Number(btn.dataset.count);
   if (next === count) return;
-  if (activeDelivery?.inFlight) {
-    showStatus('Wait for the active delivery to finish before changing the grid.', 'error');
+  if (guardDeliverySensitiveChange('changing the grid')) return;
+  const previousCount = count;
+  const previousKeys = [...selectedKeys];
+  setCount(next);
+  showStatus('Preparing panels…');
+  if (!await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey))) {
+    count = previousCount;
+    selectedKeys = previousKeys;
+    renderCountButtons();
     return;
   }
-  activeDelivery = null;
-  setCount(next);
   saveWorkspaceState().catch(() => {});
-  showStatus('Preparing panels…');
-  await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey));
-  showStatus('');
-  renderGrid();
+  if (await renderGrid()) showStatus('');
 });
 
 el.attachBtn.addEventListener('click', () => el.imageInput.click());
 
+let composerDragDepth = 0;
+el.composer.addEventListener('dragenter', event => {
+  if (!event.dataTransfer?.types?.includes('Files')) return;
+  event.preventDefault();
+  composerDragDepth += 1;
+  el.composer.classList.add('is-dragover');
+});
+el.composer.addEventListener('dragover', event => {
+  if (!event.dataTransfer?.types?.includes('Files')) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+});
+el.composer.addEventListener('dragleave', () => {
+  composerDragDepth = Math.max(0, composerDragDepth - 1);
+  if (!composerDragDepth) el.composer.classList.remove('is-dragover');
+});
+el.composer.addEventListener('drop', event => {
+  if (!event.dataTransfer?.files?.length) return;
+  event.preventDefault();
+  composerDragDepth = 0;
+  el.composer.classList.remove('is-dragover');
+  enqueueAttachmentFiles(event.dataTransfer.files).catch(() => showStatus('Could not load attachment.', 'error'));
+});
+
 el.imageInput.addEventListener('change', e => {
-  loadImageFiles(e.target.files).catch(() => showStatus('Could not load attachment.', 'error'));
+  enqueueAttachmentFiles(e.target.files).catch(() => showStatus('Could not load attachment.', 'error'));
 });
 
 document.addEventListener('paste', e => {
-  loadImageFiles(e.clipboardData?.files).catch(() => {});
+  if (!e.clipboardData?.files?.length) return;
+  enqueueAttachmentFiles(e.clipboardData.files).catch(() => {});
 });
 
 el.imageStrip.addEventListener('click', event => {
@@ -1361,39 +1737,9 @@ el.prompt.addEventListener('keydown', event => {
   el.composer.requestSubmit();
 });
 
-el.composer.addEventListener('submit', async event => {
+el.composer.addEventListener('submit', event => {
   event.preventDefault();
-  if (el.sendBtn.disabled) return;
-  if (activeDelivery && activeDelivery.draftRevision === draftRevision) {
-    showStatus('This preserved draft already has unresolved panels. Use a safe panel retry or edit the draft to start a new delivery.', 'error');
-    return;
-  }
-
-  const promptSnapshot = el.prompt.value;
-  const text = promptSnapshot.trim();
-  const imageIds = attachedImages.map(image => image.id);
-  const images = broadcastImages();
-  if (!text && !images.length) {
-    showStatus('Enter a prompt or attach a file first.', 'error');
-    return;
-  }
-
-  const { delivery, controllers } = createDelivery(text, images, promptSnapshot, imageIds);
-  activeDelivery = delivery;
-  el.sendBtn.disabled = true;
-  el.composer.classList.add('is-broadcasting');
-  showStatus('Preparing verified delivery…');
-
-  try {
-    await dispatchDelivery(delivery, controllers);
-  } catch (error) {
-    delivery.inFlight = false;
-    showStatus(error?.message ? `Error: ${error.message}` : 'Broadcast failed. Your draft was preserved.', 'error');
-  } finally {
-    el.sendBtn.disabled = false;
-    el.composer.classList.remove('is-broadcasting');
-    el.prompt.focus();
-  }
+  beginComposerDelivery();
 });
 
 // ---------------------------------------------------------------------------
@@ -1426,15 +1772,16 @@ async function init() {
     while (selectedKeys.length < count) selectedKeys.push(filler[selectedKeys.length] || randomKeys(1)[0]);
   }
   selectedKeys = selectedKeys.slice(0, count);
-  saveWorkspaceState().catch(() => {});
 
   // Arm frame rules and clear selected-provider caches before iframe navigation.
-  showStatus('Preparing panels…');
-  await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey));
-  showStatus('');
-
   renderCountButtons();
-  renderGrid();
+  showStatus('Preparing panels…');
+  if (!await prepareFrames(selectedKeys.slice(0, count).flatMap(originsForKey))) {
+    el.prompt.focus();
+    return;
+  }
+  saveWorkspaceState().catch(() => {});
+  if (await renderGrid()) showStatus('');
   el.prompt.focus();
 }
 

@@ -9,21 +9,25 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
+    "smoke:layout": "node tests/layout-smoke.mjs",
+    "smoke:attachments": "node tests/attachment-smoke.mjs",
+    "smoke:submit": "node tests/submit-smoke.mjs",
+    "smoke:live": "node tests/live-readiness-smoke.mjs",
     "ui:shot": "node tests/ui-visual-smoke.mjs",
     "sandcastle": "tsx .sandcastle/main.mts"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wasely/ai-broadcaster.git"
+    "url": "git+https://github.com/blixvip/ai-broadcaster.git"
   },
   "keywords": [],
   "author": "",
   "license": "UNLICENSED",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/wasely/ai-broadcaster/issues"
+    "url": "https://github.com/blixvip/ai-broadcaster/issues"
   },
-  "homepage": "https://github.com/wasely/ai-broadcaster#readme",
+  "homepage": "https://github.com/blixvip/ai-broadcaster#readme",
   "devDependencies": {
     "@ai-hero/sandcastle": "^0.12.0",
     "playwright": "^1.60.0",

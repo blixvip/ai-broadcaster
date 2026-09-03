@@ -6,6 +6,7 @@
     maxCount: 8,
     maxFileBytes: 20 * 1024 * 1024,
     maxTotalBytes: 48 * 1024 * 1024,
+    maxFanoutEncodedBytes: 192 * 1024 * 1024,
     allowedTypes: Object.freeze(['image/*', 'application/pdf'])
   });
 
@@ -48,20 +49,45 @@
     return { ok: true, reason: '', count: attachments.length, totalBytes };
   }
 
+  function validateAttachmentFanout(value, targetCount) {
+    const validation = validateAttachments(value);
+    if (!validation.ok) return validation;
+
+    const count = Math.max(1, Number(targetCount) || 1);
+    const encodedBytes = (Array.isArray(value) ? value : []).reduce(
+      (total, attachment) => total + String(attachment?.base64 || '').length,
+      0
+    );
+    const fanoutEncodedBytes = encodedBytes * count;
+    if (fanoutEncodedBytes > ATTACHMENT_LIMITS.maxFanoutEncodedBytes) {
+      return {
+        ...validation,
+        ok: false,
+        reason: 'attachment_fanout_too_large',
+        targetCount: count,
+        fanoutEncodedBytes
+      };
+    }
+    return { ...validation, targetCount: count, fanoutEncodedBytes };
+  }
+
   const STRONG_EVIDENCE = new Set([
     'user_turn_matched',
     'image_user_turn',
     'attachment_user_turn',
-    'generation_started',
-    'assistant_activity'
+    'text_attachment_user_turn',
+    'generation_started'
   ]);
 
   const WEAK_EVIDENCE = new Set([
+    'assistant_activity',
     'composer_cleared',
     'input_detached',
     'attachment_consumed',
     'route_changed',
-    'unmatched_user_turn'
+    'unmatched_user_turn',
+    'mixed_delivery_partial_evidence',
+    'generation_started_without_attachment_turn'
   ]);
 
   const SAFE_PRE_DISPATCH_REASONS = new Set([
@@ -82,22 +108,38 @@
 
   function diffEvidenceSnapshots(baseline = {}, current = {}, payload = {}) {
     const changes = [];
-    if (payload.hasText && current.matchingUserTurns > baseline.matchingUserTurns) {
-      changes.push({ type: 'user_turn_matched', strength: 'strong' });
-    }
     const hasAttachments = payload.hasAttachments || payload.hasImages;
-    if (hasAttachments && current.imageUserTurns > baseline.imageUserTurns) {
-      changes.push({
-        type: payload.hasAttachments ? 'attachment_user_turn' : 'image_user_turn',
-        strength: 'strong'
-      });
+    const isMixed = payload.hasText && hasAttachments;
+    const matchingTurnAdded = current.matchingUserTurns > baseline.matchingUserTurns;
+    const attachmentTurnAdded = current.imageUserTurns > baseline.imageUserTurns;
+    const combinedTurnAdded = current.matchingAttachmentUserTurns > baseline.matchingAttachmentUserTurns;
+
+    if (isMixed) {
+      if (combinedTurnAdded) {
+        changes.push({ type: 'text_attachment_user_turn', strength: 'strong' });
+      } else if (matchingTurnAdded || attachmentTurnAdded) {
+        changes.push({ type: 'mixed_delivery_partial_evidence', strength: 'weak' });
+      }
+    } else {
+      if (payload.hasText && matchingTurnAdded) {
+        changes.push({ type: 'user_turn_matched', strength: 'strong' });
+      }
+      if (hasAttachments && attachmentTurnAdded) {
+        changes.push({
+          type: payload.hasAttachments ? 'attachment_user_turn' : 'image_user_turn',
+          strength: 'strong'
+        });
+      }
     }
     if (!baseline.stopVisible && current.stopVisible) {
-      changes.push({ type: 'generation_started', strength: 'strong' });
+      changes.push({
+        type: hasAttachments ? 'generation_started_without_attachment_turn' : 'generation_started',
+        strength: hasAttachments ? 'weak' : 'strong'
+      });
     }
     if ((current.assistantCount > baseline.assistantCount)
       || (current.assistantText && current.assistantText !== baseline.assistantText)) {
-      changes.push({ type: 'assistant_activity', strength: 'strong' });
+      changes.push({ type: 'assistant_activity', strength: 'weak' });
     }
     if (!current.composerConnected) {
       changes.push({ type: 'input_detached', strength: 'weak' });
@@ -199,6 +241,7 @@
     WEAK_EVIDENCE,
     estimatedDataUrlBytes,
     validateAttachments,
+    validateAttachmentFanout,
     diffEvidenceSnapshots,
     classifyEvidence,
     deriveRetrySafety,

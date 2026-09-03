@@ -15,13 +15,74 @@ const statusEl = document.getElementById('status');
 
 let attachedImages = []; // { id, base64, name, type }
 let nextImageId = 1;
+let pendingAttachmentLoads = 0;
+let attachmentLoadQueue = Promise.resolve();
 let isListening = false;
 let workspacePanelCount = 4;
+let draftRevision = 0;
+let pendingDelivery = null;
+let uncertainDraftRevision = null;
+let broadcastInFlight = false;
+const broadcastButtonMarkup = broadcastBtn.innerHTML;
+
+function unresolvedDeliveryResults(delivery) {
+  if (!delivery) return [];
+  return delivery.expectedPanelIds
+    .map(panelId => delivery.results.get(panelId))
+    .filter(result => result && (result.attempt?.outcome || result.outcome) !== 'verified');
+}
+
+function safeRetryResults(delivery) {
+  return unresolvedDeliveryResults(delivery).filter(result =>
+    (result.attempt?.retry || result.retry)?.safe === true);
+}
+
+function renderBroadcastButton() {
+  if (broadcastInFlight) {
+    broadcastBtn.disabled = true;
+    broadcastBtn.textContent = 'Sending…';
+    broadcastBtn.title = 'Delivery in progress';
+    return;
+  }
+  if (uncertainDraftRevision === draftRevision) {
+    broadcastBtn.disabled = true;
+    broadcastBtn.textContent = 'Edit Draft To Send Again';
+    broadcastBtn.title = 'Delivery state is uncertain; check panels, then edit the draft before sending again.';
+    return;
+  }
+  const current = pendingDelivery?.draftRevision === draftRevision ? pendingDelivery : null;
+  const unresolved = unresolvedDeliveryResults(current);
+  const retryable = safeRetryResults(current);
+  if (!unresolved.length) {
+    broadcastBtn.disabled = false;
+    broadcastBtn.innerHTML = broadcastButtonMarkup;
+    broadcastBtn.title = 'Broadcast to every registered workspace panel';
+    return;
+  }
+
+  if (!retryable.length) {
+    broadcastBtn.disabled = true;
+    broadcastBtn.textContent = 'Edit Draft To Send Again';
+    broadcastBtn.title = 'Previous submission may already have succeeded; edit the draft before sending again.';
+    return;
+  }
+
+  broadcastBtn.disabled = false;
+  broadcastBtn.textContent = `Retry ${retryable.length} Safe Panel${retryable.length === 1 ? '' : 's'}`;
+  broadcastBtn.title = 'Retry only panels that failed before any submit action.';
+}
+
+function markDraftChanged() {
+  draftRevision += 1;
+  pendingDelivery = null;
+  uncertainDraftRevision = null;
+  renderBroadcastButton();
+}
 
 const PANEL_COUNTS = [2, 3, 4, 5, 6];
 const PROVIDERS = globalThis.AIB_PROVIDERS || [];
 const WORKSPACE_DEFAULTS = globalThis.AIB_DEFAULT_PANEL_URLS || [
-  'https://gemini.google.com/app',
+  'https://gemini.google.com/app?hl=en',
   'https://chat.deepseek.com/',
   'https://venice.ai/chat/agent',
   'https://chat.mistral.ai/'
@@ -50,10 +111,13 @@ if (SpeechRecognition) {
   };
 
   recognition.onresult = (event) => {
-    const transcript = Array.from(event.results)
+    const nextValue = Array.from(event.results)
       .map(r => r[0].transcript)
       .join('');
-    promptEl.value = transcript;
+    if (promptEl.value !== nextValue) {
+      promptEl.value = nextValue;
+      markDraftChanged();
+    }
   };
 
   recognition.onend = () => {
@@ -82,6 +146,7 @@ function attachmentErrorMessage(reason) {
     too_many_attachments: `Attach no more than ${ATTACHMENT_LIMITS.maxCount} files.`,
     attachment_too_large: 'Each attachment must be 20 MB or smaller.',
     attachment_batch_too_large: 'The combined attachment payload must be 48 MB or smaller.',
+    attachment_fanout_too_large: 'This attachment set is too large to send safely to every panel. Remove or compress one or more files.',
     unsupported_attachment_type: 'Only images and PDF files are supported.',
     invalid_attachment_data: 'One attachment could not be read safely.'
   }[reason] || 'Could not attach that file.';
@@ -110,11 +175,11 @@ function attachmentFilesFromList(files) {
 }
 
 function attachmentFilesFromClipboard(clipboardData) {
-  const files = attachmentFilesFromList(clipboardData?.files);
+  const files = Array.from(clipboardData?.files || []);
   if (files.length) return files;
 
   return Array.from(clipboardData?.items || [])
-    .filter(item => item.type === 'application/pdf' || item.type?.startsWith('image/'))
+    .filter(item => item.kind === 'file')
     .map(item => item.getAsFile())
     .filter(Boolean);
 }
@@ -126,39 +191,16 @@ function renderAttachedImages() {
   document.querySelector('.textarea-wrap')?.classList.toggle('has-images', hasImages);
 
   for (const image of attachedImages) {
-    const tile = document.createElement('div');
-    tile.className = `image-tile${image.type === 'application/pdf' ? ' is-pdf' : ''}`;
-
-    if (image.type === 'application/pdf') {
-      const badge = document.createElement('span');
-      badge.className = 'file-badge';
-      badge.textContent = 'PDF';
-      badge.title = image.name;
-      tile.append(badge);
-    } else {
-      const img = document.createElement('img');
-      img.src = image.base64;
-      img.alt = image.name;
-      tile.append(img);
-    }
-
-    const remove = document.createElement('button');
-    remove.className = 'remove-btn';
-    remove.type = 'button';
-    remove.title = `Remove ${image.name}`;
-    remove.setAttribute('aria-label', `Remove ${image.name}`);
-    remove.dataset.imageId = String(image.id);
-    remove.textContent = '×';
-
-    tile.append(remove);
-    imagePreview.append(tile);
+    imagePreview.append(globalThis.AIBAttachmentUI.createChip(image));
   }
 }
 
 async function loadImageFiles(files) {
-  const candidates = attachmentFilesFromList(files);
-  if (!candidates.length) {
-    if (Array.from(files || []).length) showStatus('Only images and PDF files are supported.', 'error');
+  const sourceFiles = Array.from(files || []);
+  if (!sourceFiles.length) return;
+  const candidates = attachmentFilesFromList(sourceFiles);
+  if (candidates.length !== sourceFiles.length) {
+    showStatus('Only images and PDF files are supported. No files from this batch were added.', 'error');
     return;
   }
   if (attachedImages.length + candidates.length > ATTACHMENT_LIMITS.maxCount) {
@@ -177,6 +219,7 @@ async function loadImageFiles(files) {
     return;
   }
 
+  showStatus(`Loading ${candidates.length} attachment${candidates.length === 1 ? '' : 's'}…`, 'info');
   const attachments = await Promise.all(candidates.map(readAttachmentFile));
   const validation = DELIVERY.validateAttachments([...attachedImages, ...attachments]);
   if (!validation.ok) {
@@ -184,8 +227,26 @@ async function loadImageFiles(files) {
     return;
   }
   attachedImages.push(...attachments);
+  markDraftChanged();
   imageInput.value = '';
   renderAttachedImages();
+  const totalBytes = attachedImages.reduce((sum, image) => sum + (image.size || 0), 0);
+  showStatus(`${attachedImages.length} attachment${attachedImages.length === 1 ? '' : 's'} ready · ${globalThis.AIBAttachmentUI.formatBytes(totalBytes)}.`, 'success');
+}
+
+function enqueueAttachmentFiles(files) {
+  const snapshot = Array.from(files || []);
+  pendingAttachmentLoads += 1;
+  dropZone.setAttribute('aria-busy', 'true');
+  const task = attachmentLoadQueue.then(() => loadImageFiles(snapshot));
+  attachmentLoadQueue = task.catch(() => {});
+  return task.finally(() => {
+    pendingAttachmentLoads = Math.max(0, pendingAttachmentLoads - 1);
+    if (!pendingAttachmentLoads) {
+      dropZone.removeAttribute('aria-busy');
+      imageInput.value = '';
+    }
+  });
 }
 
 function broadcastImages() {
@@ -193,9 +254,14 @@ function broadcastImages() {
 }
 
 dropZone.addEventListener('click', () => imageInput.click());
+dropZone.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  imageInput.click();
+});
 
 imageInput.addEventListener('change', (e) => {
-  loadImageFiles(e.target.files).catch(() => {
+  enqueueAttachmentFiles(e.target.files).catch(() => {
     showStatus('Could not load one or more attachments.', 'error');
   });
 });
@@ -212,14 +278,16 @@ dropZone.addEventListener('dragleave', () => {
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  loadImageFiles(e.dataTransfer.files).catch(() => {
+  enqueueAttachmentFiles(e.dataTransfer.files).catch(() => {
     showStatus('Could not load one or more attachments.', 'error');
   });
 });
 
 // Also support pasting attachments directly into the popup
 document.addEventListener('paste', (e) => {
-  loadImageFiles(attachmentFilesFromClipboard(e.clipboardData)).catch(() => {
+  const files = attachmentFilesFromClipboard(e.clipboardData);
+  if (!files.length) return;
+  enqueueAttachmentFiles(files).catch(() => {
     showStatus('Could not load one or more pasted attachments.', 'error');
   });
 });
@@ -230,6 +298,7 @@ imagePreview.addEventListener('click', event => {
 
   const imageId = Number(remove.dataset.imageId);
   attachedImages = attachedImages.filter(image => image.id !== imageId);
+  markDraftChanged();
   renderAttachedImages();
 });
 
@@ -247,7 +316,10 @@ function clampPanelCount(value) {
 
 function renderWorkspacePanelCount() {
   for (const btn of workspacePanelCountEl.querySelectorAll('button')) {
-    btn.classList.toggle('active', Number(btn.dataset.count) === workspacePanelCount);
+    const selected = Number(btn.dataset.count) === workspacePanelCount;
+    btn.classList.toggle('active', selected);
+    btn.setAttribute('aria-pressed', String(selected));
+    btn.setAttribute('aria-label', `${btn.dataset.count} workspace panels`);
   }
   workspaceBtn.lastChild.textContent = ` Open New ${workspacePanelCount}-Panel Workspace`;
 }
@@ -309,6 +381,7 @@ workspaceBtn.addEventListener('click', async () => {
   }
 });
 
+promptEl.addEventListener('input', markDraftChanged);
 promptEl.addEventListener('keydown', event => {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
 
@@ -317,57 +390,167 @@ promptEl.addEventListener('keydown', event => {
 });
 
 // Broadcast
+function deliveryRecordFromResponse(response, draft) {
+  const panelResults = Array.isArray(response?.panelResults)
+    ? response.panelResults
+    : Array.isArray(response?.results) ? response.results : [];
+  const expectedPanelIds = [...new Set(panelResults.map(result => result?.panelId).filter(Boolean))];
+  if (!expectedPanelIds.length) return null;
+  return {
+    deliveryId: response.deliveryId,
+    workspaceTabId: Number.isInteger(response.workspaceTabId)
+      ? response.workspaceTabId
+      : panelResults.find(result => Number.isInteger(result?.frame?.tabId))?.frame?.tabId ?? null,
+    draftRevision: draft.revision,
+    promptSnapshot: draft.promptSnapshot,
+    imageIds: draft.imageIds,
+    expectedPanelIds,
+    results: new Map(panelResults.map(result => [result.panelId, result])),
+    attemptNumbers: new Map(expectedPanelIds.map(panelId => [panelId, 1]))
+  };
+}
+
+function mergeDeliveryResults(delivery, response) {
+  const results = response?.panelResults || response?.results || [];
+  for (const result of results) {
+    if (result?.panelId && delivery.expectedPanelIds.includes(result.panelId)) {
+      delivery.results.set(result.panelId, result);
+    }
+  }
+}
+
+function retryPanelAttempts(delivery) {
+  return safeRetryResults(delivery).flatMap(result => {
+    const panelId = result.panelId;
+    const panelEpoch = Number(result.panelEpoch ?? result.attempt?.panelEpoch);
+    if (!panelId || !Number.isInteger(panelEpoch) || panelEpoch < 1) return [];
+    const attemptNumber = (delivery.attemptNumbers.get(panelId) || 1) + 1;
+    delivery.attemptNumbers.set(panelId, attemptNumber);
+    return [{
+      panelId,
+      panelEpoch,
+      providerKey: result.frame?.providerKey || result.attempt?.providerKey || result.providerKey || '',
+      hostname: result.hostname || result.attempt?.hostname || result.frame?.hostname || '',
+      attemptId: `${delivery.deliveryId}:${panelId}:${attemptNumber}`,
+      isRetry: true
+    }];
+  });
+}
+
+function summarizeDeliveryRecord(delivery) {
+  if (!delivery) return null;
+  const results = delivery.expectedPanelIds.map(panelId => delivery.results.get(panelId)).filter(Boolean);
+  return DELIVERY.summarizeDelivery(
+    results,
+    delivery.expectedPanelIds.map(panelId => ({ panelId }))
+  );
+}
+
+function clearVerifiedDraft(draft) {
+  if (draftRevision !== draft.revision || promptEl.value !== draft.promptSnapshot) return false;
+  promptEl.value = '';
+  const deliveredIds = new Set(draft.imageIds);
+  attachedImages = attachedImages.filter(image => !deliveredIds.has(image.id));
+  pendingDelivery = null;
+  uncertainDraftRevision = null;
+  draftRevision += 1;
+  renderAttachedImages();
+  return true;
+}
+
+function showDeliveryResult(summary, response, delivery) {
+  const outcome = summary?.outcome || response?.outcome || 'failed';
+  const verified = summary?.verified ?? response?.verified ?? response?.count ?? 0;
+  const expected = summary?.expected ?? response?.expected ?? response?.frames ?? 0;
+  const retryable = safeRetryResults(delivery).length;
+  if (outcome === 'verified' && expected > 0) {
+    showStatus(`Verified by all ${verified} panel${verified === 1 ? '' : 's'}.`, 'success');
+  } else if (outcome === 'partial') {
+    showStatus(
+      retryable
+        ? `${verified}/${expected} panels verified. ${retryable} failed before submit and can be retried safely.`
+        : `${verified}/${expected} panels verified. Check unresolved panels before sending again.`,
+      'error'
+    );
+  } else if (outcome === 'unverified') {
+    showStatus('Submission was dispatched but could not be verified. Check panels before sending again.', 'error');
+  } else if (outcome === 'no_targets') {
+    showStatus('No ready workspace panels were found. Draft retained.', 'error');
+  } else {
+    const attachmentFailure = String(response?.reason || '').includes('attachment');
+    showStatus(attachmentFailure
+      ? attachmentErrorMessage(response.reason)
+      : retryable
+        ? `${retryable} panel${retryable === 1 ? '' : 's'} failed before submit and can be retried safely.`
+        : 'Delivery failed. Draft retained.', 'error');
+  }
+}
+
 broadcastBtn.addEventListener('click', async () => {
+  if (pendingAttachmentLoads) {
+    showStatus('Wait for attachments to finish loading before sending.', 'error');
+    return;
+  }
+  if (broadcastInFlight) return;
+
   const promptSnapshot = promptEl.value;
   const text = promptSnapshot.trim();
   const imageIds = attachedImages.map(image => image.id);
   const images = broadcastImages();
-
   if (!text && images.length === 0) {
     showStatus('Enter a prompt or attach a file first.', 'error');
     return;
   }
 
-  broadcastBtn.disabled = true;
-  broadcastBtn.textContent = 'Sending...';
-  showStatus('Broadcasting...', 'info');
+  const revision = draftRevision;
+  const retrying = pendingDelivery?.draftRevision === revision ? pendingDelivery : null;
+  const panelAttempts = retrying ? retryPanelAttempts(retrying) : [];
+  if (retrying && !panelAttempts.length) {
+    showStatus('Previous submission may already have succeeded. Check panels or edit the draft before sending again.', 'error');
+    renderBroadcastButton();
+    return;
+  }
+
+  const draft = { revision, promptSnapshot, imageIds };
+  broadcastInFlight = true;
+  renderBroadcastButton();
+  showStatus(retrying ? `Retrying ${panelAttempts.length} safe panel${panelAttempts.length === 1 ? '' : 's'}…` : 'Broadcasting…', 'info');
 
   try {
     const response = await chrome.runtime.sendMessage({
       action: 'execute',
+      workspaceTabId: retrying?.workspaceTabId ?? undefined,
+      deliveryId: retrying?.deliveryId,
+      panelAttempts: retrying ? panelAttempts : undefined,
       text,
       images,
       imageBase64: images[0]?.base64 || null,
-      imageName:   images[0]?.name   || null,
-      imageType:   images[0]?.type   || null
+      imageName: images[0]?.name || null,
+      imageType: images[0]?.type || null
     });
-    const outcome = response?.outcome || 'failed';
-    const verified = response?.verified ?? response?.count ?? 0;
-    const expected = response?.expected ?? response?.frames ?? 0;
 
-    if (outcome === 'verified' && expected > 0) {
-      if (promptEl.value === promptSnapshot) promptEl.value = '';
-      const deliveredIds = new Set(imageIds);
-      attachedImages = attachedImages.filter(image => !deliveredIds.has(image.id));
-      renderAttachedImages();
-      showStatus(`Verified by all ${verified} panel${verified === 1 ? '' : 's'}.`, 'success');
-    } else if (outcome === 'partial') {
-      showStatus(`${verified}/${expected} panels verified. Draft retained for inspection.`, 'error');
-    } else if (outcome === 'unverified') {
-      showStatus('Submission was dispatched but could not be verified. Draft retained.', 'error');
-    } else if (outcome === 'no_targets') {
-      showStatus('No ready workspace panels were found. Draft retained.', 'error');
-    } else {
-      showStatus('Delivery failed. Draft retained.', 'error');
+    if (draftRevision !== revision) {
+      showStatus('Previous delivery finished. Current edited draft was preserved.', 'info');
+      return;
     }
+
+    const delivery = retrying || deliveryRecordFromResponse(response, draft);
+    if (retrying) mergeDeliveryResults(delivery, response);
+    const summary = summarizeDeliveryRecord(delivery) || response;
+    const knownPreDispatchFailure = summary?.outcome === 'no_targets'
+      || String(response?.reason || '').includes('attachment');
+    uncertainDraftRevision = !delivery && !knownPreDispatchFailure ? revision : null;
+    if (summary?.outcome === 'verified' && (summary.expected ?? 0) > 0) {
+      clearVerifiedDraft(draft);
+    } else {
+      pendingDelivery = delivery;
+    }
+    showDeliveryResult(summary, response, delivery);
   } catch (err) {
-    showStatus('Error: ' + (err.message || 'Unknown error'), 'error');
+    uncertainDraftRevision = revision;
+    showStatus('Delivery state is uncertain. Check panels, then edit the draft before sending again.', 'error');
   } finally {
-    broadcastBtn.disabled = false;
-    broadcastBtn.innerHTML = `
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-      </svg>
-      Broadcast to All AIs`;
+    broadcastInFlight = false;
+    renderBroadcastButton();
   }
 });

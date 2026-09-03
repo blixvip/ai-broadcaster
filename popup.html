@@ -11,8 +11,10 @@
 <body>
   <div class="container">
     <div class="header">
-      <img class="logo" src="icons/icon48.png" alt="AI Broadcaster">
-      <span class="title">AI Broadcaster</span>
+      <div class="brand-lockup">
+        <img class="logo" src="icons/icon48.png" alt="">
+        <span class="title">AI Broadcaster</span>
+      </div>
     </div>
 
     <div class="prompt-section">
@@ -32,7 +34,7 @@
     </div>
 
     <div class="image-section">
-      <div id="dropZone" class="drop-zone">
+      <div id="dropZone" class="drop-zone" role="button" tabindex="0" aria-label="Attach images or PDF files">
         <input type="file" id="imageInput" accept="image/*,application/pdf" multiple hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="attach-icon">
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
@@ -68,10 +70,11 @@
       Open New Workspace
     </button>
 
-    <div id="status" class="status hidden"></div>
+    <div id="status" class="status hidden" role="status" aria-live="polite" aria-atomic="true"></div>
   </div>
 
   <script src="delivery-protocol.js"></script>
+  <script src="attachment-ui.js"></script>
   <script src="providers.js"></script>
   <script src="popup.js"></script>
 </body>

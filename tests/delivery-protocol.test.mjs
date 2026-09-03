@@ -12,6 +12,7 @@ const BASELINE = {
   userTurns: 2,
   matchingUserTurns: 0,
   imageUserTurns: 0,
+  matchingAttachmentUserTurns: 0,
   assistantCount: 2,
   assistantText: 'previous answer',
   stopVisible: false,
@@ -71,6 +72,33 @@ test('new image-bearing user turn verifies image-only delivery', () => {
   assert.equal(protocol.classifyEvidence(evidence).reason, 'image_user_turn');
 });
 
+test('mixed delivery verifies only when text and attachment share one new user turn', () => {
+  const combined = protocol.diffEvidenceSnapshots(BASELINE, {
+    ...BASELINE,
+    userTurns: 3,
+    matchingUserTurns: 1,
+    imageUserTurns: 1,
+    matchingAttachmentUserTurns: 1
+  }, { hasText: true, hasAttachments: true });
+  assert.equal(protocol.classifyEvidence(combined).reason, 'text_attachment_user_turn');
+
+  const separate = protocol.diffEvidenceSnapshots(BASELINE, {
+    ...BASELINE,
+    userTurns: 4,
+    matchingUserTurns: 1,
+    imageUserTurns: 1,
+    matchingAttachmentUserTurns: 0,
+    stopVisible: true
+  }, { hasText: true, hasAttachments: true });
+  assert.deepEqual(protocol.classifyEvidence(separate), {
+    outcome: 'unverified',
+    confidence: 'weak',
+    reason: 'weak_evidence_only'
+  });
+  assert.equal(separate.some(entry => entry.type === 'mixed_delivery_partial_evidence'), true);
+  assert.equal(separate.some(entry => entry.type === 'generation_started_without_attachment_turn'), true);
+});
+
 test('composer clear, route change, and attachment consumption remain weak', () => {
   const evidence = protocol.diffEvidenceSnapshots(BASELINE, {
     ...BASELINE,
@@ -81,6 +109,18 @@ test('composer clear, route change, and attachment consumption remain weak', () 
   const result = protocol.classifyEvidence(evidence);
   assert.equal(result.outcome, 'unverified');
   assert.equal(result.confidence, 'weak');
+});
+
+test('unrelated assistant mutation does not clear the preserved draft', () => {
+  const evidence = protocol.diffEvidenceSnapshots(BASELINE, {
+    ...BASELINE,
+    assistantCount: 3,
+    assistantText: 'hydrated previous answer'
+  }, { hasText: true, hasImages: false });
+  const result = protocol.classifyEvidence(evidence);
+  assert.equal(result.outcome, 'unverified');
+  assert.equal(result.confidence, 'weak');
+  assert.equal(result.reason, 'weak_evidence_only');
 });
 
 test('no evidence times out honestly', () => {
@@ -143,6 +183,20 @@ test('attachment validation rejects unsupported, oversized, and excessive payloa
     base64: 'data:image/png;base64,AA==', type: 'image/png', size: 1
   }));
   assert.equal(protocol.validateAttachments(tooMany).reason, 'too_many_attachments');
+});
+
+test('attachment fanout bounds aggregate encoded payload', () => {
+  const attachments = [
+    { base64: 'data:image/png;base64,AA==', type: 'image/png', size: 1 }
+  ];
+  const perTargetBytes = attachments[0].base64.length;
+  const excessiveTargets = Math.floor(protocol.ATTACHMENT_LIMITS.maxFanoutEncodedBytes / perTargetBytes) + 1;
+
+  assert.equal(protocol.validateAttachmentFanout(attachments, 6).ok, true);
+  assert.equal(
+    protocol.validateAttachmentFanout(attachments, excessiveTargets).reason,
+    'attachment_fanout_too_large'
+  );
 });
 
 test('generic attachment-bearing user turn is strong evidence', () => {

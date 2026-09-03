@@ -3,7 +3,7 @@
 (function initProviders(global) {
   const providers = [
     // ── Group A: Foundation AIs — fast, reliable, stable selectors ────────────
-    { key: 'gemini',      label: 'Gemini',      url: 'https://gemini.google.com/app',                domain: 'gemini.google.com',    category: 'General',     aliases: ['google', 'bard'],                              group: 'A' },
+    { key: 'gemini',      label: 'Gemini',      url: 'https://gemini.google.com/app?hl=en',          domain: 'gemini.google.com',    category: 'General',     aliases: ['google', 'bard'],                              group: 'A', locale: 'en-US' },
     { key: 'deepseek',    label: 'DeepSeek',    url: 'https://chat.deepseek.com/',                   domain: 'chat.deepseek.com',    category: 'General',     aliases: ['r1', 'reasoning', 'coding'],                   group: 'A' },
     { key: 'mistral',     label: 'Le Chat',     url: 'https://chat.mistral.ai/',                     domain: 'chat.mistral.ai',      category: 'General',     aliases: ['mistral'],                                     group: 'B' },
     { key: 'grok',        label: 'Grok',        url: 'https://x.com/i/grok',                         domain: 'x.com',                domains: ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'grok.com'], category: 'General', aliases: ['xai', 'twitter', 'x'], group: 'B' },
@@ -15,7 +15,7 @@
     { key: 'poe',         label: 'Poe',         url: 'https://poe.com/',                             domain: 'poe.com',              category: 'Multi-model', aliases: ['quora', 'bots'],                               group: 'B' },
     { key: 'venice',      label: 'Venice',      url: 'https://venice.ai/chat/agent',                 domain: 'venice.ai',            domains: ['venice.ai', 'www.venice.ai', 'chat.venice.ai'], category: 'Private', aliases: ['private', 'web search', 'open source models'], group: 'B' },
     { key: 'lmarena',     label: 'Arena',       url: 'https://arena.ai/',                            domain: 'arena.ai',             domains: ['arena.ai', 'lmarena.ai'],                       category: 'Compare',     aliases: ['lmarena', 'chatbot arena', 'models'],          group: 'B' },
-    { key: 'ai-studio',   label: 'AI Studio',   url: 'https://aistudio.google.com/prompts/new_chat', domain: 'aistudio.google.com',  category: 'Developer',   aliases: ['google ai studio', 'gemini api', 'prompt'],    group: 'B' },
+    { key: 'ai-studio',   label: 'AI Studio',   url: 'https://aistudio.google.com/prompts/new_chat?hl=en', domain: 'aistudio.google.com', category: 'Developer', aliases: ['google ai studio', 'gemini api', 'prompt'], group: 'B', locale: 'en-US' },
     // ── Group C: Complex / Shadow-DOM AIs — need more time ────────────────────
     { key: 'copilot',     label: 'Copilot',     url: 'https://copilot.microsoft.com/',               domain: 'copilot.microsoft.com',category: 'General',     aliases: ['microsoft', 'bing'],                           group: 'C' },
     { key: 'qwen',        label: 'Qwen',        url: 'https://chat.qwen.ai/',                        domain: 'chat.qwen.ai',         domains: ['chat.qwen.ai', 'chat.qwenlm.ai'],                category: 'General',     aliases: ['alibaba', 'qwq'],                              group: 'C' },
@@ -25,7 +25,7 @@
   ];
 
   const defaultPanelUrls = [
-    'https://gemini.google.com/app',
+    'https://gemini.google.com/app?hl=en',
     'https://chat.deepseek.com/',
     'https://venice.ai/chat/agent',
     'https://chat.mistral.ai/',

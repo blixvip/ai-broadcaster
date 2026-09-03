@@ -7,6 +7,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const extensionPath = fileURLToPath(new URL('..', import.meta.url));
+const { applyProviderPromptPolicy } = require(path.join(extensionPath, 'prompt-policy.js'));
 
 function loadPlaywright() {
   const candidates = [
@@ -154,6 +155,18 @@ try {
       id: 'text-plus-image',
       text: `AIB-MIXED-${Date.now()}`,
       files: [{ name: 'single.png', mimeType: 'image/png', buffer: png }]
+    },
+    {
+      id: 'text-plus-image-pdf',
+      text: `AIB-MIXED-FILES-${Date.now()}`,
+      files: [
+        { name: 'mixed.png', mimeType: 'image/png', buffer: png },
+        {
+          name: 'mixed.pdf',
+          mimeType: 'application/pdf',
+          buffer: Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
+        }
+      ]
     }
   ];
 
@@ -212,8 +225,10 @@ try {
     result.workspace.prompt === ''
     && result.workspace.attachmentTiles === 0
     && result.workspace.status.includes('Verified by all 2 panels')
-    && Object.values(result.providerResults).every(provider =>
-      provider.text === result.expectedText
+    && Object.entries(result.providerResults).every(([providerName, provider]) =>
+      provider.text === (providerName === 'deepseek'
+        ? applyProviderPromptPolicy('chat.deepseek.com', result.id === 'image-only-multi' ? '' : result.expectedText)
+        : result.expectedText)
       && provider.attachmentCount === result.expectedAttachments
     )
   )

@@ -7,6 +7,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const extensionPath = fileURLToPath(new URL('..', import.meta.url));
+const { applyProviderPromptPolicy } = require(path.join(extensionPath, 'prompt-policy.js'));
 
 function loadPlaywright() {
   const candidates = [
@@ -88,6 +89,7 @@ function buttonFixture() {
       const turn=document.createElement('div');
       turn.dataset.testid='user-message';
       turn.textContent=value;
+      for(const attachment of input.parentElement.querySelectorAll(':scope > [data-testid="attachment"]'))turn.appendChild(attachment);
       input.parentElement.appendChild(turn);
       document.querySelector('#result').textContent=value;
       input.textContent='';
@@ -132,6 +134,7 @@ function enterFallbackFixture() {
       const turn=document.createElement('div');
       turn.dataset.testid='user-message';
       turn.textContent=value;
+      for(const attachment of input.parentElement.querySelectorAll(':scope > [data-testid="attachment"]'))turn.appendChild(attachment);
       input.parentElement.appendChild(turn);
       document.querySelector('#result').textContent=value;
       input.value='';
@@ -170,6 +173,7 @@ function unconfirmedButtonFixture() {
         const turn=document.createElement('div');
         turn.dataset.testid='user-message';
         turn.textContent=value;
+        for(const attachment of input.parentElement.querySelectorAll(':scope > [data-testid="attachment"]'))turn.appendChild(attachment);
         input.parentElement.appendChild(turn);
         document.querySelector('#result').textContent=value;
         input.value='';
@@ -238,6 +242,7 @@ try {
   await page.waitForFunction(() => document.querySelectorAll('#grid iframe').length === 3);
 
   const nonce = `AIB-SUBMIT-PROBE-${Date.now()}`;
+  const deepseekExpected = applyProviderPromptPolicy('chat.deepseek.com', nonce);
   await page.locator('#prompt').fill(nonce);
   await page.locator('#imageInput').setInputFiles({
     name: 'success-probe.png',
@@ -267,7 +272,7 @@ try {
   );
   await deepseek.waitForFunction(
     expected => document.querySelector('#result')?.textContent === expected,
-    nonce,
+    deepseekExpected,
     { timeout: 15000 }
   );
   await venice.waitForFunction(
@@ -302,6 +307,81 @@ try {
     prompt: await page.locator('#prompt').inputValue(),
     attachmentTiles: await page.locator('#imageStrip .image-tile').count()
   };
+
+  // The popup retains the same draft after a partial delivery and retries only
+  // the panel that failed before any submit action.
+  await venice.evaluate(() => { window.__removeComposer(); });
+  const popup = await context.newPage();
+  const popupErrors = [];
+  popup.on('console', message => { if (message.type() === 'error') popupErrors.push(message.text()); });
+  popup.on('pageerror', error => popupErrors.push(String(error)));
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  const popupNonce = `AIB-POPUP-RETRY-${Date.now()}`;
+  await popup.locator('#prompt').fill(popupNonce);
+  await popup.locator('#imageInput').setInputFiles({
+    name: 'popup-retry.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
+  });
+  await popup.waitForFunction(() => document.querySelectorAll('#imagePreview .attachment-chip').length === 1);
+  await popup.locator('#broadcastBtn').click();
+  await popup.waitForFunction(
+    () => document.querySelector('#status')?.textContent.includes('2/3 panels verified'),
+    null,
+    { timeout: 30000 }
+  );
+  const popupPartialCounts = {
+    geminiClicks: await gemini.evaluate(() => window.__clickCount),
+    deepseekEnters: await deepseek.evaluate(() => window.__enterCount),
+    veniceClicks: await venice.evaluate(() => window.__clickCount)
+  };
+  const popupPartialRecovery = {
+    prompt: await popup.locator('#prompt').inputValue(),
+    attachmentChips: await popup.locator('#imagePreview .attachment-chip').count(),
+    status: (await popup.locator('#status').textContent())?.trim() || '',
+    button: (await popup.locator('#broadcastBtn').textContent())?.trim() || ''
+  };
+  await venice.evaluate(() => { window.__installComposer(); });
+  await popup.locator('#broadcastBtn').click();
+  await popup.waitForFunction(
+    () => document.querySelector('#status')?.textContent.includes('Verified by all 3 panels'),
+    null,
+    { timeout: 30000 }
+  );
+  const popupRetryRecovery = {
+    prompt: await popup.locator('#prompt').inputValue(),
+    attachmentChips: await popup.locator('#imagePreview .attachment-chip').count(),
+    status: (await popup.locator('#status').textContent())?.trim() || '',
+    buttonDisabled: await popup.locator('#broadcastBtn').isDisabled(),
+    counts: {
+      geminiClicks: await gemini.evaluate(() => window.__clickCount),
+      deepseekEnters: await deepseek.evaluate(() => window.__enterCount),
+      veniceClicks: await venice.evaluate(() => window.__clickCount)
+    }
+  };
+  await popup.close();
+
+  // READY is continuously supervised: removing a composer must invalidate the
+  // state, and restoring it must recover without reloading the iframe.
+  await page.waitForFunction(
+    () => ['ready', 'verified'].includes(document.querySelector('.panel[data-provider="venice"]')?.dataset.deliveryState),
+    null,
+    { timeout: 10000 }
+  );
+  await venice.evaluate(() => { window.__removeComposer(); });
+  await page.waitForFunction(
+    () => document.querySelector('.panel[data-provider="venice"]')?.dataset.deliveryState === 'checking',
+    null,
+    { timeout: 10000 }
+  );
+  const invalidatedReadiness = await page.locator('.panel[data-provider="venice"]').getAttribute('data-delivery-state');
+  await venice.evaluate(() => { window.__installComposer(); });
+  await page.waitForFunction(
+    () => document.querySelector('.panel[data-provider="venice"]')?.dataset.deliveryState === 'ready',
+    null,
+    { timeout: 10000 }
+  );
+  const recoveredReadiness = await page.locator('.panel[data-provider="venice"]').getAttribute('data-delivery-state');
 
   // Probe a safe pre-dispatch failure: the third provider temporarily has no
   // composer, so only that panel may be retried after the first two verify.
@@ -380,6 +460,44 @@ try {
     retryButtonsVisible: await page.locator('.panel-retry:visible').count()
   };
 
+  // A changed draft may start a new delivery after an unresolved idle attempt.
+  // A second command while that delivery is in flight, and a command blocked by
+  // attachment loading, must never be acknowledged as broadcasting.
+  await Promise.all([
+    gemini.evaluate(() => { window.__acceptSubmission = true; }),
+    deepseek.evaluate(() => { window.__acceptSubmission = true; }),
+    venice.evaluate(() => { window.__acceptSubmission = true; })
+  ]);
+  const commandNonce = `AIB-COMMAND-PROBE-${Date.now()}`;
+  const busyNonce = `AIB-BUSY-PROBE-${Date.now()}`;
+  const commandExpected = `${retryNonce}\n\n${commandNonce}`;
+  const commandOutcomes = await page.evaluate(({ commandNonce: next, busyNonce: busy }) => ({
+    accepted: addToComposer(next, [], true),
+    busy: addToComposer(busy, [], true)
+  }), { commandNonce, busyNonce });
+  await gemini.waitForFunction(
+    () => window.__clickCount >= 4,
+    null,
+    { timeout: 15000 }
+  );
+  await page.waitForFunction(
+    () => !document.querySelector('#sendBtn')?.disabled,
+    null,
+    { timeout: 30000 }
+  );
+  const commandProviderResult = await gemini.evaluate(() => document.querySelector('#result')?.textContent || '');
+  const commandRecovery = {
+    prompt: await page.locator('#prompt').inputValue(),
+    attachmentTiles: await page.locator('#imageStrip .image-tile').count(),
+    workspaceStatus: (await page.locator('#status').textContent())?.trim() || ''
+  };
+  const loadingNonce = `AIB-LOADING-GUARD-${Date.now()}`;
+  const attachmentLoadingOutcome = await page.evaluate(next => {
+    pendingAttachmentLoads += 1;
+    try { return addToComposer(next, [], true); }
+    finally { pendingAttachmentLoads -= 1; }
+  }, loadingNonce);
+
   const telemetryBeforeReset = await page.evaluate(() =>
     chrome.runtime.sendMessage({ action: 'getTelemetry' }));
   const telemetryReset = await page.evaluate(() =>
@@ -395,13 +513,27 @@ try {
     && buttonPath.result === nonce
     && fallbackPath.clickCount === 0
     && fallbackPath.enterCount === 1
-    && fallbackPath.result === nonce
+    && fallbackPath.result === deepseekExpected
     && thirdButtonPath.clickCount === 1
     && thirdButtonPath.enterCount === 0
     && thirdButtonPath.result === nonce
     && fullWorkspaceStatus.includes('Verified by all 3 panels')
     && successfulRecovery.prompt === ''
     && successfulRecovery.attachmentTiles === 0
+    && popupPartialRecovery.prompt === popupNonce
+    && popupPartialRecovery.attachmentChips === 1
+    && popupPartialRecovery.status.includes('2/3 panels verified')
+    && popupPartialRecovery.button === 'Retry 1 Safe Panel'
+    && popupRetryRecovery.prompt === ''
+    && popupRetryRecovery.attachmentChips === 0
+    && popupRetryRecovery.status.includes('Verified by all 3 panels')
+    && popupRetryRecovery.buttonDisabled === false
+    && popupRetryRecovery.counts.geminiClicks === popupPartialCounts.geminiClicks
+    && popupRetryRecovery.counts.deepseekEnters === popupPartialCounts.deepseekEnters
+    && popupRetryRecovery.counts.veniceClicks === popupPartialCounts.veniceClicks + 1
+    && popupErrors.length === 0
+    && invalidatedReadiness === 'checking'
+    && recoveredReadiness === 'ready'
     && partialRecovery.prompt === partialNonce
     && partialRecovery.attachmentTiles === 1
     && partialRecovery.workspaceStatus.includes('2/3 verified')
@@ -416,12 +548,24 @@ try {
     && failedRecovery.attachmentTiles === 1
     && failedRecovery.workspaceStatus.includes('provider acceptance could not be proven')
     && failedRecovery.retryButtonsVisible === 0
+    && commandOutcomes.accepted?.added === true
+    && commandOutcomes.accepted?.broadcasted === true
+    && commandOutcomes.busy?.added === true
+    && commandOutcomes.busy?.broadcasted === false
+    && commandOutcomes.busy?.reason === 'delivery_in_progress'
+    && commandProviderResult.replace(/\s+/g, ' ').trim() === commandExpected.replace(/\s+/g, ' ').trim()
+    && commandRecovery.prompt === `${commandExpected}\n\n${busyNonce}`
+    && commandRecovery.attachmentTiles === 1
+    && commandRecovery.workspaceStatus.includes('Verified by all 3 panels')
+    && attachmentLoadingOutcome?.added === true
+    && attachmentLoadingOutcome?.broadcasted === false
+    && attachmentLoadingOutcome?.reason === 'attachment_loading'
     && telemetryBeforeReset?.ok
-    && telemetryBeforeReset.snapshot?.totals?.attempts === 10
+    && telemetryBeforeReset.snapshot?.totals?.attempts === 17
     && telemetryBeforeReset.snapshot?.totals?.responseSamples >= 1
     && telemetryBeforeReset.snapshot?.providers?.gemini?.retries === 0
     && telemetryBeforeReset.snapshot?.providers?.deepseek?.retries === 0
-    && telemetryBeforeReset.snapshot?.providers?.venice?.retries === 1
+    && telemetryBeforeReset.snapshot?.providers?.venice?.retries === 2
     && telemetryBeforeReset.ranking?.length === 3
     && telemetryReset?.ok
     && telemetryAfterReset.snapshot?.totals?.attempts === 0
@@ -436,11 +580,25 @@ try {
     thirdButtonPath,
     fullWorkspaceStatus,
     successfulRecovery,
+    popupNonce,
+    popupPartialRecovery,
+    popupPartialCounts,
+    popupRetryRecovery,
+    popupErrors,
+    invalidatedReadiness,
+    recoveredReadiness,
     partialNonce,
     partialRecovery,
     safeRetryRecovery,
     retryNonce,
     failedRecovery,
+    commandNonce,
+    busyNonce,
+    commandOutcomes,
+    commandProviderResult,
+    commandRecovery,
+    loadingNonce,
+    attachmentLoadingOutcome,
     telemetryBeforeReset,
     telemetryReset,
     telemetryAfterReset,
