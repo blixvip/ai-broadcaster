@@ -1,8 +1,8 @@
 # AI Broadcaster
 
-Run named workspaces that broadcast prompts and images to free-tier AI chats — one message, many providers, at once.
+Run named workspaces that broadcast prompts, images, and PDFs to free-tier AI chats — one message, many providers, at once.
 
-AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat sites as live panels inside a workspace tab, then injects one prompt (text and/or images) into every registered panel and verifies delivery in each one independently.
+AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat sites as live panels inside a workspace tab, then injects one prompt (text, images, and/or PDFs) into every registered panel and verifies delivery in each one independently.
 
 ## Table of Contents
 
