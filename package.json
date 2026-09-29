@@ -2,7 +2,7 @@
   "name": "ai-broadcaster",
   "version": "1.5.3",
   "private": true,
-  "description": "Run named workspaces that broadcast prompts and images to free-tier AI chats — one message, many providers, at once.",
+  "description": "Run named workspaces that broadcast prompts, images, and PDFs to free-tier AI chats — one message, many providers, at once.",
   "main": "background.js",
   "directories": {
     "test": "tests"
