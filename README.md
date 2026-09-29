@@ -1,6 +1,22 @@
 # AI Broadcaster
 
+**Ask 17 AI chats the same question with one message, and know each one actually got it.**
+
+<p>
+  <img src="icons/icon128.png" width="64" alt="AI Broadcaster icon">
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Chrome-Manifest%20V3-111?style=flat-square" alt="Chrome Manifest V3">
+  <img src="https://img.shields.io/badge/version-1.5.3-111?style=flat-square" alt="Version 1.5.3">
+  <img src="https://img.shields.io/badge/providers-17-111?style=flat-square" alt="17 providers">
+  <img src="https://img.shields.io/badge/build%20step-none-111?style=flat-square" alt="No build step">
+  <a href="https://blixvip.github.io/ai-broadcaster-privacy/"><img src="https://img.shields.io/badge/privacy-policy-111?style=flat-square" alt="Privacy policy"></a>
+</p>
+
 Run named workspaces that broadcast prompts, images, and PDFs to free-tier AI chats — one message, many providers, at once.
+
+**Why:** comparing answers from Gemini, DeepSeek, Perplexity, Grok and friends normally means a dozen tabs and a lot of copy-paste. AI Broadcaster puts them side by side in one tab, sends your prompt (and attachments) to all of them, and only clears your draft once each panel shows real evidence that the message landed.
 
 AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat sites as live panels inside a workspace tab, then injects one prompt (text, images, and/or PDFs) into every registered panel and verifies delivery in each one independently.
 
@@ -90,7 +106,7 @@ Host permissions and content scripts are scoped to the registered provider domai
 ├── offscreen.html / offscreen.js  # Offscreen document for clipboard reads (service workers can't read clipboard)
 ├── popup.html / popup.js / popup.css      # Toolbar popup composer
 ├── workspace.html / workspace.js / workspace.css  # Multi-panel workspace UI
-├── provider-marks.js               # TODO: purpose not covered in PROVIDER_AUTOMATION.md — confirm before relying on it
+├── provider-marks.js               # Inline SVG marks shown next to each provider in the workspace UI
 ├── telemetry.js                    # Local-only attempt/verified/failed counters in chrome.storage
 ├── rules/ai_frame_rules.json       # Static declarativeNetRequest rules for embedding provider frames
 ├── icons/                          # Extension + brand icons
@@ -152,13 +168,14 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 - `telemetry.js` stores only local counters (attempts/verified/unverified/failed, versioned under `aib_telemetry_v1`) in `chrome.storage` — nothing is sent off-device.
 - The only outbound `fetch` in the codebase is in `grab.js`, converting an already-visible hovered image's URL into a data URL for the composer (`credentials: 'omit'`) — not telemetry or exfiltration.
 - No backend, analytics, or third-party service is included in this repository.
+- Published privacy policy: <https://blixvip.github.io/ai-broadcaster-privacy/> (source: [blixvip/ai-broadcaster-privacy](https://github.com/blixvip/ai-broadcaster-privacy)).
 
 ## Known Limitations
 
-- Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`. **TODO:** run the authenticated live-provider matrix after loading this checkout into the user's normal Chrome profile; automated fixture and UI-shell checks do not prove current third-party DOM compatibility.
+- Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`. **Still to do:** run the authenticated live-provider matrix after loading this checkout into the user's normal Chrome profile; automated fixture and UI-shell checks do not prove current third-party DOM compatibility.
 - Closed shadow roots cannot be traversed for composer discovery.
 - No CI workflow is configured in this repository.
 
 ## License
 
-TODO: no `LICENSE` file is present in this repository. Add one before treating this as open source.
+No `LICENSE` file is included yet, so default copyright applies: the code is public to read, but no open-source license has been granted.
