@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/providers-17-111?style=flat-square" alt="17 providers">
   <img src="https://img.shields.io/badge/build%20step-none-111?style=flat-square" alt="No build step">
   <a href="https://blixvip.github.io/ai-broadcaster-privacy/"><img src="https://img.shields.io/badge/privacy-policy-111?style=flat-square" alt="Privacy policy"></a>
+  <a href="https://discord.gg/zEB4VjmfSb"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 Run named workspaces that broadcast prompts, images, and PDFs to free-tier AI chats — one message, many providers, at once.
@@ -34,6 +35,7 @@ AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat si
 - [Optional: Screenshot Hotkey (Windows)](#optional-screenshot-hotkey-windows)
 - [Privacy](#privacy)
 - [Known Limitations](#known-limitations)
+- [Community](#community)
 - [License](#license)
 
 ## Features
@@ -175,6 +177,10 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 - Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`. **Still to do:** run the authenticated live-provider matrix after loading this checkout into the user's normal Chrome profile; automated fixture and UI-shell checks do not prove current third-party DOM compatibility.
 - Closed shadow roots cannot be traversed for composer discovery.
 - No CI workflow is configured in this repository.
+
+## Community
+
+💬 [Join the Discord](https://discord.gg/zEB4VjmfSb) for questions, help, feedback, and updates.
 
 ## License
 
