@@ -1,12 +1,15 @@
-# AI Broadcaster
-
-**Ask 17 AI chats the same question with one message, and know each one actually got it.**
-
-<p>
-  <img src="icons/icon128.png" width="64" alt="AI Broadcaster icon">
+<p align="center">
+  <img src="icons/icon128.png" width="84" alt="AI Broadcaster icon">
 </p>
 
-<p>
+<h1 align="center">AI Broadcaster</h1>
+
+<p align="center">
+  <b>Ask 17 AI chats the same question with one message, and know each one actually got it.</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/blixvip/ai-broadcaster/stargazers"><img src="https://img.shields.io/github/stars/blixvip/ai-broadcaster?style=flat-square&color=22c3e6" alt="GitHub stars"></a>
   <img src="https://img.shields.io/badge/Chrome-Manifest%20V3-111?style=flat-square" alt="Chrome Manifest V3">
   <img src="https://img.shields.io/badge/version-1.5.3-111?style=flat-square" alt="Version 1.5.3">
   <img src="https://img.shields.io/badge/providers-17-111?style=flat-square" alt="17 providers">
@@ -21,22 +24,24 @@ Run named workspaces that broadcast prompts, images, and PDFs to free-tier AI ch
 
 AI Broadcaster is a Manifest V3 Chrome extension. It embeds supported AI chat sites as live panels inside a workspace tab, then injects one prompt (text, images, and/or PDFs) into every registered panel and verifies delivery in each one independently.
 
-## Table of Contents
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#registered-providers">Registered Providers</a> ·
+  <a href="#install-unpacked">Install (Unpacked)</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#permissions">Permissions</a> ·
+  <a href="#project-structure">Project Structure</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#testing">Testing</a> ·
+  <a href="#automated-maintenance-sandcastle">Automated Maintenance (Sandcastle)</a> ·
+  <a href="#optional-screenshot-hotkey-windows">Optional: Screenshot Hotkey (Windows)</a> ·
+  <a href="#privacy">Privacy</a> ·
+  <a href="#known-limitations">Known Limitations</a> ·
+  <a href="#community">Community</a> ·
+  <a href="#license">License</a>
+</p>
 
-- [Features](#features)
-- [Registered Providers](#registered-providers)
-- [Install (Unpacked)](#install-unpacked)
-- [Usage](#usage)
-- [Permissions](#permissions)
-- [Project Structure](#project-structure)
-- [Architecture](#architecture)
-- [Testing](#testing)
-- [Automated Maintenance (Sandcastle)](#automated-maintenance-sandcastle)
-- [Optional: Screenshot Hotkey (Windows)](#optional-screenshot-hotkey-windows)
-- [Privacy](#privacy)
-- [Known Limitations](#known-limitations)
-- [Community](#community)
-- [License](#license)
+---
 
 ## Features
 
