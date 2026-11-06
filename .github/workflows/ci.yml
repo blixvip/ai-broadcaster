@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The node:test suites use only Node built-ins, so no `npm ci` is needed.
+      # Playwright smoke tests (npm run smoke:*) need Chrome and are not run here.
+      - run: npm test
