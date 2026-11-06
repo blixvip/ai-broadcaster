@@ -181,11 +181,16 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 
 - Provider selectors and detection logic are inherently fragile to upstream UI changes; see the "no current live-provider audit is implied" note in `PROVIDER_AUTOMATION.md`. **Still to do:** run the authenticated live-provider matrix after loading this checkout into the user's normal Chrome profile; automated fixture and UI-shell checks do not prove current third-party DOM compatibility.
 - Closed shadow roots cannot be traversed for composer discovery.
-- No CI workflow is configured in this repository.
 
 ## Community
 
 💬 [Join the Discord](https://discord.gg/zEB4VjmfSb) for questions, help, feedback, and updates.
+
+## Contributors
+
+Thanks to everyone who has helped build AI Broadcaster! New here? Read [CONTRIBUTING.md](CONTRIBUTING.md) and pick up a [good first issue](https://github.com/blixvip/ai-broadcaster/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+
+<a href="https://github.com/blixvip/ai-broadcaster/graphs/contributors"><img src="https://contrib.rocks/image?repo=blixvip/ai-broadcaster" alt="Contributors" /></a>
 
 ## License
 
