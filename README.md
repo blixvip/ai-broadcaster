@@ -189,4 +189,4 @@ Configuration lives in `.sandcastle/`. Docker Desktop must be running. Authentic
 
 ## License
 
-No `LICENSE` file is included yet, so default copyright applies: the code is public to read, but no open-source license has been granted.
+[MIT](LICENSE) © 2026 blixvip. Contributions are released under the same license — see [CONTRIBUTING.md](CONTRIBUTING.md).
