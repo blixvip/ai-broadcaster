@@ -1,13 +1,15 @@
 # Contributing to AI Broadcaster
 
-Thanks for helping! Questions and ideas are welcome in the **[Discord](https://discord.gg/zEB4VjmfSb)**, and bugs go in [GitHub issues](https://github.com/blixvip/ai-broadcaster/issues/new/choose).
+> 💬 **Before you open a PR, join the [blix open source Discord](https://discord.gg/wJfHQXfEMM).** It's the home for contributors across every blixvip repo: ask questions, run ideas by us, and talk through your PR.
+
+Thanks for helping! Questions and ideas are welcome in the **[Discord](https://discord.gg/wJfHQXfEMM)**, and bugs go in [GitHub issues](https://github.com/blixvip/ai-broadcaster/issues/new/choose).
 
 ## Finding something to work on
 
 - [Good first issues](https://github.com/blixvip/ai-broadcaster/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are small and list the files to touch.
 - [Help wanted](https://github.com/blixvip/ai-broadcaster/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) issues are bigger.
 - Comment on the issue to claim it so two people don't build the same thing. If you go quiet for a week, it opens up again.
-- Have your own idea, such as a new provider? Raise it in the [Discord](https://discord.gg/zEB4VjmfSb) or open an issue before you build anything larger than a bug fix.
+- Have your own idea, such as a new provider? Raise it in the [Discord](https://discord.gg/wJfHQXfEMM) or open an issue before you build anything larger than a bug fix.
 
 By contributing, you agree your work is released under the project's [MIT License](LICENSE).
 
@@ -64,4 +66,4 @@ Rules the code depends on:
 - `PROVIDER_AUTOMATION.md`: the detailed reference for all of the above
 - `tests/`: `*.test.mjs` run under `node --test`, and `*-smoke.mjs` are Playwright scripts
 
-Made something with it? Show it off in the [Discord](https://discord.gg/zEB4VjmfSb).
+Made something with it? Show it off in the [Discord](https://discord.gg/wJfHQXfEMM).
