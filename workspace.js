@@ -1095,6 +1095,14 @@ function setCount(next) {
 // ---------------------------------------------------------------------------
 async function resetPanelFromAuth(message) {
   const direct = message?.panelId ? panelControllers.get(message.panelId) : null;
+  // The panel has navigated since the service worker recorded this binding
+  // (provider switch, address-bar jump). Its old auth identity must not reset
+  // any panel, least of all one that happens to share the provider.
+  if (direct) {
+    const staleEpoch = Number.isInteger(message.panelEpoch) && message.panelEpoch !== direct.panelEpoch;
+    const staleProvider = message.providerKey && message.providerKey !== direct.providerKey;
+    if (staleEpoch || staleProvider) return;
+  }
   if (direct && (!Number.isInteger(message.panelEpoch) || message.panelEpoch === direct.panelEpoch)) {
     const url = message.url || direct.frame.src;
     if (await prepareFrames([`https://${hostOf(url)}`, ...originsForKey(direct.providerKey)])) {

@@ -585,6 +585,9 @@ function isAuthUrl(url, panelHost) {
   const host = u.hostname;
   // In-app sign-in routes on the provider's own host remain usable in-frame.
   if (host === panelHost) return false;
+  // Moving to another registered provider is a panel navigation, not an auth
+  // redirect; only an explicit auth route on that host is treated as one.
+  if (AI_HOSTS.has(host) && !AUTH_PATH_PATTERN.test(u.pathname)) return false;
   if (AUTH_HOST_PATTERNS.some(re => re.test(host))) return true;
   return AUTH_PATH_PATTERN.test(u.pathname);
 }
