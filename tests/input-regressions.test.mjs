@@ -77,14 +77,81 @@ test('workspace panel selection persists per workspace instance', () => {
   assert.match(workspace, /selectedKeys: selectedKeys\.slice\(0, count\)/);
 });
 
-test('every registered provider host has permissions and automation coverage', () => {
+function assertHostSetMatches(label, actualHosts, expectedHosts) {
+  const actual = new Set(actualHosts);
+  const expected = new Set(expectedHosts);
+  const missing = [...expected].filter(host => !actual.has(host)).sort();
+  const extra = [...actual].filter(host => !expected.has(host)).sort();
+
+  assert.deepEqual(
+    { missing, extra },
+    { missing: [], extra: [] },
+    `${label} host list mismatch; missing: ${missing.join(', ') || 'none'}; extra: ${extra.join(', ') || 'none'}`
+  );
+}
+
+function hostsFromMatchPatterns(patterns) {
+  return patterns.map(pattern => new URL(pattern.replace(/\*$/, '')).hostname);
+}
+
+function configuredContentHosts(source) {
+  const objectStart = source.indexOf('const PLATFORMS = {');
+  const aliasStart = source.indexOf('// X Premium/Premium+ accounts access Grok', objectStart);
+  assert.notEqual(objectStart, -1, 'content.js is missing the PLATFORMS map');
+  assert.notEqual(aliasStart, -1, 'content.js is missing the platform alias section');
+
+  const platformSource = source.slice(objectStart, aliasStart);
+  const hosts = [...platformSource.matchAll(/^  '([^']+)': \{/gm)].map(match => match[1]);
+  const aliasEnd = source.indexOf('const COMMON_INPUT_SELS', aliasStart);
+  const aliasesSource = source.slice(aliasStart, aliasEnd);
+  for (const match of aliasesSource.matchAll(/for \(const host of \[([^\]]+)\]\) \{\s*PLATFORMS\[host\]/g)) {
+    hosts.push(...[...match[1].matchAll(/'([^']+)'/g)].map(alias => alias[1]));
+  }
+  return hosts;
+}
+
+test('provider hosts exactly match host permissions', () => {
   const sandbox = {};
   sandbox.globalThis = sandbox;
   vm.runInNewContext(providerSource, sandbox, { filename: 'providers.js' });
-  const permittedHosts = new Set(manifest.host_permissions.map(pattern => new URL(pattern.replace('*', '')).hostname));
+  assertHostSetMatches(
+    'manifest.host_permissions',
+    hostsFromMatchPatterns(manifest.host_permissions),
+    sandbox.AIB_AI_HOSTS
+  );
+});
 
-  for (const host of sandbox.AIB_AI_HOSTS) {
-    assert.ok(permittedHosts.has(host), `${host} missing host permission`);
-    assert.ok(content.includes(host), `${host} missing content automation config`);
+test('provider hosts exactly match both content script match lists', () => {
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(providerSource, sandbox, { filename: 'providers.js' });
+  for (const [index, script] of manifest.content_scripts.entries()) {
+    if (index === 2) continue;
+    assertHostSetMatches(
+      `manifest.content_scripts[${index}].matches`,
+      hostsFromMatchPatterns(script.matches),
+      sandbox.AIB_AI_HOSTS
+    );
   }
+});
+
+test('provider hosts exactly match both declarative net request domain lists', () => {
+  const rules = JSON.parse(fs.readFileSync(new URL('../rules/ai_frame_rules.json', import.meta.url), 'utf8'));
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(providerSource, sandbox, { filename: 'providers.js' });
+  for (const rule of rules) {
+    assertHostSetMatches(
+      `rules/ai_frame_rules.json rule ${rule.id} requestDomains`,
+      rule.condition.requestDomains,
+      sandbox.AIB_AI_HOSTS
+    );
+  }
+});
+
+test('every registered provider host has an exact content automation entry or alias', () => {
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(providerSource, sandbox, { filename: 'providers.js' });
+  assertHostSetMatches('content.js PLATFORMS', configuredContentHosts(content), sandbox.AIB_AI_HOSTS);
 });
